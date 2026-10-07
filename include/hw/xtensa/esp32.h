@@ -18,6 +18,7 @@
 #include "hw/misc/esp32_crosscore_int.h"
 #include "hw/ssi/esp32_spi.h"
 #include "hw/i2c/esp32_i2c.h"
+#include "hw/misc/esp32_i2s.h"
 #include "hw/nvram/esp32_efuse.h"
 #include "hw/xtensa/esp32_intc.h"
 #include "hw/misc/esp32_flash_enc.h"
@@ -43,6 +44,7 @@ typedef struct Esp32SocState {
     Esp32TimgState timg[ESP32_TIMG_COUNT];
     Esp32SpiState spi[ESP32_SPI_COUNT];
     Esp32I2CState i2c[ESP32_I2C_COUNT];
+    Esp32I2SState i2s[2];
     Esp32ShaState sha;
     Esp32AesState aes;
     Esp32RsaState rsa;

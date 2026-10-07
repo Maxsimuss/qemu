@@ -24,6 +24,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32.h"
+#include "hw/xtensa/esp32_wifi.h"
 #include "hw/misc/ssi_psram.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "core-esp32/core-isa.h"
@@ -159,6 +160,12 @@ static void esp32_soc_reset(DeviceState *dev)
     if (s->requested_reset == 0) {
         s->requested_reset = ESP32_SOC_RESET_ALL;
     }
+    if (s->requested_reset & (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_PERIPH)) {
+        s->syscon_tick_num[0] = 39;
+        s->syscon_tick_num[1] = 79;
+        s->syscon_tick_num[2] = 11;
+        s->syscon_tick_num[3] = 99;
+    }
     if (s->requested_reset & ESP32_SOC_RESET_RTC) {
         device_cold_reset(DEVICE(&s->rtc_cntl));
     }
@@ -183,6 +190,9 @@ static void esp32_soc_reset(DeviceState *dev)
         }
         for (int i = 0; i < ESP32_I2C_COUNT; i++) {
             device_cold_reset(DEVICE(&s->i2c[i]));
+        }
+        for (int i = 0; i < 2; i++) {
+            device_cold_reset(DEVICE(&s->i2s[i]));
         }
         device_cold_reset(DEVICE(&s->twai));
         device_cold_reset(DEVICE(&s->efuse));
@@ -211,15 +221,91 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
 
     bool stall;
     if (n == 0) {
-        stall = s->rtc_cntl.cpu_stall_state[0];
+        stall = s->cpu_clock_stall || s->rtc_cntl.cpu_stall_state[0];
     } else {
-        stall = s->rtc_cntl.cpu_stall_state[1] || s->dport.appcpu_stall_state || (!s->dport.appcpu_clkgate_state);
+        stall = s->cpu_clock_stall || s->rtc_cntl.cpu_stall_state[1] ||
+                s->dport.appcpu_stall_state || !s->dport.appcpu_clkgate_state;
     }
 
     if (stall != s->cpu[n].env.runstall) {
         xtensa_runstall(&s->cpu[n].env, stall);
+        if (!stall && s->cpu_clock_saved_halted[n] &&
+            !s->cpu[n].env.pending_irq_level) {
+            s->cpu[n].parent_obj.halted = true;
+        }
+        if (!stall) {
+            s->cpu_clock_saved_halted[n] = false;
+        }
     }
 }
+
+static unsigned esp32_syscon_tick_index(Esp32SocState *s)
+{
+    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
+        return 1;
+    }
+    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_8M) {
+        return 2;
+    }
+    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_APLL) {
+        return 3;
+    }
+    return 0;
+}
+
+static void esp32_update_uart_clocks(Esp32SocState *s)
+{
+    unsigned tick = esp32_syscon_tick_index(s);
+    uint64_t ref_den = s->apb_clock_den * (s->syscon_tick_num[tick] + 1);
+    for (unsigned i = 0; i < ESP32_UART_COUNT; i++) {
+        esp32_uart_set_clock_sources(&s->uart[i],
+            s->apb_clock_num, s->apb_clock_den,
+            s->apb_clock_num, ref_den);
+    }
+}
+
+static uint64_t esp32_syscon_read(void *opaque, hwaddr address,
+                                  unsigned size)
+{
+    Esp32SocState *s = opaque;
+    static const hwaddr offsets[] = { 0x04, 0x08, 0x0c, 0x3c };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++) {
+        if (address == offsets[i]) {
+            return s->syscon_tick_num[i] & 0xff;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "esp32.syscon: invalid read at 0x%" HWADDR_PRIx "\n",
+                  address);
+    return 0;
+}
+
+static void esp32_syscon_write(void *opaque, hwaddr address, uint64_t value,
+                               unsigned size)
+{
+    Esp32SocState *s = opaque;
+    static const hwaddr offsets[] = { 0x04, 0x08, 0x0c, 0x3c };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++) {
+        if (address == offsets[i]) {
+            s->syscon_tick_num[i] = value & 0xff;
+            esp32_update_uart_clocks(s);
+            return;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "esp32.syscon: invalid write at 0x%" HWADDR_PRIx "\n",
+                  address);
+}
+
+static const MemoryRegionOps esp32_syscon_ops = {
+    .read = esp32_syscon_read,
+    .write = esp32_syscon_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4,
+               .unaligned = false },
+    .impl = { .min_access_size = 4, .max_access_size = 4,
+              .unaligned = false },
+};
 
 static void esp32_clk_update(void* opaque, int n, int level)
 {
@@ -228,21 +314,120 @@ static void esp32_clk_update(void* opaque, int n, int level)
         return;
     }
 
+    /* Audio clock availability is independent of the CPU clock mux. In
+     * particular, an invalid CPU source must not retain a stale I2S APLL. */
+    uint64_t apll_num = 0, apll_den = 1;
+    esp32_rtc_get_apll_rate(&s->rtc_cntl, &apll_num, &apll_den);
+    esp32_gpio_set_apll_clkout(&s->gpio, apll_num, apll_den);
+    for (unsigned i = 0; i < 2; i++) {
+        esp32_i2s_set_apll_rate(&s->i2s[i], apll_num, apll_den);
+    }
+
     /* APB clock */
-    uint32_t apb_clk_freq, cpu_clk_freq;
+    uint32_t apb_clk_freq = 0, cpu_clk_freq = 0;
+    uint64_t apb_num = 0, apb_den = 1;
+    bool clock_valid = true;
     if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
         const uint32_t cpu_clk_mul[] = {1, 2, 3};
-        apb_clk_freq = s->rtc_cntl.pll_apb_freq;
-        cpu_clk_freq = cpu_clk_mul[s->dport.cpuperiod_sel] * apb_clk_freq;
+        if (s->dport.cpuperiod_sel >= ARRAY_SIZE(cpu_clk_mul)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "esp32: reserved CPU PLL divider\n");
+            clock_valid = false;
+        } else {
+            apb_clk_freq = s->rtc_cntl.pll_apb_freq;
+            cpu_clk_freq = cpu_clk_mul[s->dport.cpuperiod_sel] * apb_clk_freq;
+            apb_num = apb_clk_freq;
+        }
+    } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_8M) {
+        apb_clk_freq = cpu_clk_freq = 8000000;
+        apb_num = apb_clk_freq;
+    } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_APLL) {
+        if (!apll_num || !apll_den) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32: APLL CPU/APB selected but unavailable "
+                          "(disabled or invalid coefficients)\n");
+            clock_valid = false;
+        } else {
+            unsigned div;
+            if (s->dport.cpuperiod_sel == 0) {
+                div = 4;
+            } else if (s->dport.cpuperiod_sel == 1) {
+                div = 2;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "esp32: reserved CPU APLL divider %u\n",
+                              s->dport.cpuperiod_sel);
+                div = 1;
+                clock_valid = false;
+            }
+            if (clock_valid) {
+                cpu_clk_freq = (apll_num / apll_den) / div;
+                apb_num = apll_num;
+                apb_den = apll_den * div * 2;
+                apb_clk_freq = apb_num / apb_den;
+            }
+        }
     } else {
         apb_clk_freq = s->rtc_cntl.xtal_apb_freq;
         cpu_clk_freq = apb_clk_freq;
+        apb_num = apb_clk_freq;
+    }
+    if (!clock_valid) {
+        /* An unavailable selected source stops CPU/APB consumers instead of
+         * leaving the rates from the previously selected source active. */
+        apb_clk_freq = cpu_clk_freq = 0;
+        apb_num = 0;
+        apb_den = 1;
+    }
+    s->apb_clock_num = apb_num;
+    s->apb_clock_den = apb_den;
+    esp32_update_uart_clocks(s);
+    if (!clock_valid && !s->cpu_clock_stall) {
+        for (unsigned i = 0; i < ESP32_CPU_COUNT; i++) {
+            s->cpu_clock_saved_halted[i] = s->cpu[i].parent_obj.halted &&
+                                           !s->cpu[i].env.runstall;
+        }
+    }
+    s->cpu_clock_stall = !clock_valid;
+    for (unsigned i = 0; i < ESP32_CPU_COUNT; i++) {
+        esp32_cpu_stall(s, i, 1);
     }
     qdev_prop_set_int32(DEVICE(&s->frc_timer), "apb_freq", apb_clk_freq);
     qdev_prop_set_int32(DEVICE(&s->timg[0]), "apb_freq", apb_clk_freq);
     qdev_prop_set_int32(DEVICE(&s->timg[1]), "apb_freq", apb_clk_freq);
+    for (unsigned i = 0; i < ESP32_TIMG_COUNT; i++) {
+        esp32_timg_set_rtc_clock_sources(&s->timg[i],
+            s->rtc_cntl.xtal_apb_freq, s->rtc_cntl.rtc_slowclk_freq);
+    }
+    for (unsigned i = 0; i < ESP32_I2C_COUNT; i++) {
+        esp32_i2c_set_apb_freq(&s->i2c[i], apb_clk_freq);
+    }
     clock_update_hz(s->cpu[0].clock, cpu_clk_freq );
     clock_update_hz(s->cpu[1].clock, cpu_clk_freq );
+}
+
+static void esp32_perip_update(void *opaque, int bit, int level)
+{
+    Esp32SocState *s = opaque;
+    unsigned i;
+    bool i2s;
+    bool reset = !!(s->dport.perip_rst_en & BIT(bit));
+    bool enabled = !reset && !!(s->dport.perip_clk_en & BIT(bit));
+
+    switch (bit) {
+    case 7: i = 0; i2s = false; break;
+    case 18: i = 1; i2s = false; break;
+    case 4: i = 0; i2s = true; break;
+    case 21: i = 1; i2s = true; break;
+    default: return;
+    }
+    if (reset) {
+        device_cold_reset(i2s ? DEVICE(&s->i2s[i]) : DEVICE(&s->i2c[i]));
+    }
+    if (i2s) {
+        esp32_i2s_set_enabled(&s->i2s[i], enabled);
+    } else {
+        esp32_i2c_set_enabled(&s->i2c[i], enabled);
+    }
 }
 
 static void esp32_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
@@ -271,6 +456,17 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     const struct MemmapEntry *memmap = esp32_memmap;
     MemoryRegion *sys_mem = get_system_memory();
+
+    memory_region_init_io(&s->syscon_mmio, OBJECT(s), &esp32_syscon_ops, s,
+                          "esp32.syscon", 0x40);
+    memory_region_add_subregion(sys_mem, DR_REG_SYSCON_BASE, &s->syscon_mmio);
+    MemoryRegion *syscon_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(syscon_apb, OBJECT(s), "esp32.syscon-apb",
+                             &s->syscon_mmio, 0,
+                             memory_region_size(&s->syscon_mmio));
+    memory_region_add_subregion_overlap(sys_mem,
+        DR_REG_SYSCON_BASE - DR_REG_DPORT_APB_BASE + APB_REG_BASE,
+        syscon_apb, 0);
 
     MemoryRegion *dram = g_new(MemoryRegion, 1);
     MemoryRegion *iram = g_new(MemoryRegion, 1);
@@ -338,7 +534,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_RESET_GPIO, 1));
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_APPCPU_STALL_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, 1));
-    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_DPORT_CLK_UPDATE_GPIO, 0,
+    qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_CLK_UPDATE_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CLK_UPDATE_GPIO, 0));
 
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
@@ -400,6 +596,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);
+    /* The ROM analog-I2C command port is outside the RTC_CNTL block. It is
+     * present at the DPORT and APB aliases used by the original ESP32. */
+    MemoryRegion *ana_i2c = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->rtc_cntl), 1);
+    memory_region_add_subregion_overlap(sys_mem, 0x3ff4e000, ana_i2c, 0);
+    MemoryRegion *ana_i2c_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(ana_i2c_apb, OBJECT(&s->rtc_cntl),
+                             "esp32.ana_i2c-apb", ana_i2c, 0,
+                             memory_region_size(ana_i2c));
+    memory_region_add_subregion_overlap(sys_mem, 0x6000e000, ana_i2c_apb, 0);
 
     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_RTC_DIG_RESET_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_DIG_RESET_GPIO, 0));
@@ -414,6 +619,23 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+    memory_region_add_subregion(sys_mem, DR_REG_IO_MUX_BASE, &s->gpio.io_mux);
+    MemoryRegion *iomux_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(iomux_apb, OBJECT(&s->gpio), "esp32.iomux-apb",
+                            &s->gpio.io_mux, 0, memory_region_size(&s->gpio.io_mux));
+    memory_region_add_subregion(sys_mem,
+                               DR_REG_IO_MUX_BASE - DR_REG_DPORT_APB_BASE + APB_REG_BASE,
+                               iomux_apb);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source", ETS_GPIO_INTR_SOURCE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 1,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source", ETS_GPIO_NMI_SOURCE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 2,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source",
+                                             ESP32_INT_MATRIX_INPUTS + ETS_GPIO_INTR_SOURCE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 3,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source",
+                                             ESP32_INT_MATRIX_INPUTS + ETS_GPIO_NMI_SOURCE));
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
@@ -476,6 +698,26 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE + i));
+        esp32_i2c_connect_gpio(&s->i2c[i], &s->gpio, i);
+        esp32_i2c_set_apb_freq(&s->i2c[i], s->rtc_cntl.xtal_apb_freq);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        qdev_realize(DEVICE(&s->i2s[i]), &s->periph_bus, &error_fatal);
+        esp32_soc_add_periph_device(sys_mem, &s->i2s[i],
+                                   i ? DR_REG_I2S1_BASE : DR_REG_I2S_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2s[i]), 0,
+                           qdev_get_gpio_in(intmatrix_dev, ETS_I2S0_INTR_SOURCE + i));
+        esp32_i2s_connect_gpio(&s->i2s[i], &s->gpio, i);
+        uint64_t apll_num = 0, apll_den = 1;
+        esp32_rtc_get_apll_rate(&s->rtc_cntl, &apll_num, &apll_den);
+        esp32_i2s_set_apll_rate(&s->i2s[i], apll_num, apll_den);
+    }
+    const unsigned clock_bits[] = {4, 7, 18, 21};
+    for (unsigned i = 0; i < ARRAY_SIZE(clock_bits); i++) {
+        unsigned bit = clock_bits[i];
+        qemu_irq target = qdev_get_gpio_in_named(dev, "periph-update", bit);
+        qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_PERIP_CLOCK_GPIO, bit, target);
+        qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_PERIP_RESET_GPIO, bit, target);
     }
 
     /* TWAI model passes intmatrix IRQs to the SJA1000 controller model
@@ -519,13 +761,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.iomux", DR_REG_IO_MUX_BASE, 0x2000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.apbctrl", DR_REG_APB_CTRL_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
 
@@ -625,6 +864,10 @@ static void esp32_soc_init(Object *obj)
         snprintf(name, sizeof(name), "i2c%d", i);
         object_initialize_child(obj, name, &s->i2c[i], TYPE_ESP32_I2C);
     }
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(name, sizeof(name), "i2s%u", i);
+        object_initialize_child(obj, name, &s->i2s[i], TYPE_ESP32_I2S);
+    }
 
     object_initialize_child(obj, "twai", &s->twai, TYPE_ESP32_TWAI);
 
@@ -647,6 +890,7 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "rgb", &s->rgb, TYPE_ESP_RGB);
 
     qdev_init_gpio_in_named(DEVICE(s), esp32_dig_reset, ESP32_RTC_DIG_RESET_GPIO, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_perip_update, "periph-update", 32);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_reset, ESP32_RTC_CPU_RESET_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_stall, ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_clk_update, ESP32_RTC_CLK_UPDATE_GPIO, 1);
@@ -695,10 +939,49 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    char *wifi_peer_ssid;
+    char *wifi_peer_password;
+    uint8_t wifi_peer_channel;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
+
+static void esp32_machine_instance_init(Object *obj)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    ms->wifi_peer_channel = 1;
+    object_property_add_uint8_ptr(obj, "wifi-peer-channel",
+                                  &ms->wifi_peer_channel,
+                                  OBJ_PROP_FLAG_READ | OBJ_PROP_FLAG_WRITE);
+}
+
+static char *esp32_machine_get_wifi_peer_ssid(Object *obj, Error **errp)
+{
+    return g_strdup(ESP32_MACHINE(obj)->wifi_peer_ssid);
+}
+
+static void esp32_machine_set_wifi_peer_ssid(Object *obj, const char *value,
+                                              Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->wifi_peer_ssid);
+    ms->wifi_peer_ssid = g_strdup(value);
+}
+
+static char *esp32_machine_get_wifi_peer_password(Object *obj, Error **errp)
+{
+    return g_strdup(ESP32_MACHINE(obj)->wifi_peer_password);
+}
+
+static void esp32_machine_set_wifi_peer_password(Object *obj,
+                                                  const char *value,
+                                                  Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->wifi_peer_password);
+    ms->wifi_peer_password = g_strdup(value);
+}
 
 
 static void esp32_machine_init_spi_flash(Esp32SocState *ss, BlockBackend* blk)
@@ -739,19 +1022,114 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_i2c(Esp32SocState *s)
+static void esp32_machine_init_wifi(Esp32SocState *ss, Esp32MachineState *ms)
 {
-    /* It should be possible to create an I2C device from the command line,
-     * however for this to work the I2C bus must be reachable from sysbus-default.
-     * At the moment the peripherals are added to an unrelated bus, to avoid being
-     * reset on CPU reset.
-     * If we find a way to decouple peripheral reset from sysbus reset,
-     * we can move them to the sysbus and thus enable creation of i2c devices.
-     */
-    DeviceState *i2c_master = DEVICE(&s->i2c[0]);
-    I2CBus* i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
-    I2CSlave* tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
-    object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
+    MemoryRegion *sys_mem = get_system_memory();
+    /* The ESP32 MAC is physical SoC hardware.  Always realize its MMIO,
+     * interrupt, and DMA engine; a network backend is an optional peer. */
+    DeviceState *wifi = qdev_new("misc.esp32_wifi");
+    SysBusDevice *sbd;
+
+    if (ms->wifi_peer_ssid) {
+        qdev_prop_set_string(wifi, "peer-ssid", ms->wifi_peer_ssid);
+    }
+    if (ms->wifi_peer_password) {
+        qdev_prop_set_string(wifi, "peer-password", ms->wifi_peer_password);
+    }
+    qdev_prop_set_uint8(wifi, "peer-channel", ms->wifi_peer_channel);
+    qemu_configure_nic_device(wifi, true, NULL);
+    ss->wifi = wifi;
+    sbd = SYS_BUS_DEVICE(wifi);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    for (unsigned bit = 0; bit < 32; bit++) {
+        qdev_connect_gpio_out_named(DEVICE(&ss->dport),
+                                    ESP32_DPORT_WIFI_CLOCK_GPIO, bit,
+                                    qdev_get_gpio_in_named(wifi,
+                                        ESP32_WIFI_CLOCK_GPIO, bit));
+        qdev_connect_gpio_out_named(DEVICE(&ss->dport),
+                                    ESP32_DPORT_CORE_RESET_GPIO, bit,
+                                    qdev_get_gpio_in_named(wifi,
+                                        ESP32_WIFI_RESET_GPIO, bit));
+    }
+    for (unsigned bit = 0; bit < ESP32_WIFI_RFPLL_TUNE_GPIO_COUNT; bit++) {
+        qdev_connect_gpio_out_named(wifi, ESP32_WIFI_RFPLL_TUNE_GPIO, bit,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&ss->rtc_cntl),
+                                        ESP32_RTC_RFPLL_TUNE_GPIO, bit));
+    }
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_WIFI_MAC_INTR_SOURCE));
+    memory_region_add_subregion(sys_mem, DR_REG_WIFI_BASE,
+                                 sysbus_mmio_get_region(sbd, 0));
+    /* The ESP32 APB view used by firmware aliases the legacy Wi-Fi block. */
+    MemoryRegion *wifi_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_apb, OBJECT(wifi), "esp32.wifi-apb",
+                             sysbus_mmio_get_region(sbd, 0), 0,
+                             ESP32_WIFI_MMIO_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x60033000, wifi_apb, 0);
+
+    /* Reverse-engineered Wi-Fi RX-control registers occupy a private block
+     * in the TRM-reserved range.  Map only the block's observed callbacks;
+     * the device rejects unknown offsets rather than emulating flat RAM. */
+    memory_region_add_subregion(sys_mem, ESP32_WIFI_RXCTRL_BASE,
+                                 sysbus_mmio_get_region(sbd, 1));
+    MemoryRegion *wifi_rxctrl_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_rxctrl_apb, OBJECT(wifi),
+                             "esp32.wifi-rxctrl-apb",
+                             sysbus_mmio_get_region(sbd, 1), 0,
+                             ESP32_WIFI_RXCTRL_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x6001c000,
+                                         wifi_rxctrl_apb, 0);
+
+    /* IDF's FE/FE2 bases are public; only the sparse PHY-observed registers
+     * are implemented, and unknown offsets remain rejected. */
+    memory_region_add_subregion(sys_mem, ESP32_WIFI_FE_BASE,
+                                 sysbus_mmio_get_region(sbd, 2));
+    memory_region_add_subregion(sys_mem, ESP32_WIFI_FE2_BASE,
+                                 sysbus_mmio_get_region(sbd, 3));
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_TXDC_PBUS_BASE,
+                                         sysbus_mmio_get_region(sbd, 4), 1);
+    MemoryRegion *wifi_txdc_pbus_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_txdc_pbus_apb, OBJECT(wifi),
+                             "esp32-txdc-pbus-apb",
+                             sysbus_mmio_get_region(sbd, 4), 0, 4);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_TXDC_PBUS_APB,
+                                         wifi_txdc_pbus_apb, 1);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_RFPLL_FREQ_BASE,
+                                         sysbus_mmio_get_region(sbd, 5), 1);
+    MemoryRegion *wifi_rfpll_freq_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_rfpll_freq_apb, OBJECT(wifi),
+                             "esp32-wifi-rfpll-frequency-apb",
+                             sysbus_mmio_get_region(sbd, 5), 0, 4);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_RFPLL_FREQ_APB,
+                                         wifi_rfpll_freq_apb, 1);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_PHY_BT_IFS_ADDR,
+                                         sysbus_mmio_get_region(sbd, 6), 1);
+    /* coex_bt_high_prio() in the ESP-IDF PHY library touches five words in a
+     * private APB range that overlaps the Wi-Fi APB aperture. Map only the
+     * observed singleton words; do not shadow the intervening Wi-Fi window. */
+    static const hwaddr wifi_coex_apb[] = {
+        ESP32_WIFI_COEX_APB_BASE,
+        ESP32_WIFI_COEX_APB_BASE + 0x230,
+        ESP32_WIFI_COEX_APB_BASE + 0x2c60,
+        ESP32_WIFI_COEX_APB_BASE + 0x2c68,
+        ESP32_WIFI_COEX_APB_BASE + 0x2c70,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(wifi_coex_apb); i++) {
+        memory_region_add_subregion_overlap(sys_mem, wifi_coex_apb[i],
+                                             sysbus_mmio_get_region(sbd,
+                                                 7 + i), 1);
+    }
+    MemoryRegion *wifi_fe_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_fe_apb, OBJECT(wifi), "esp32.fe-apb",
+                             sysbus_mmio_get_region(sbd, 2), 0,
+                             ESP32_WIFI_FE_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x60006000, wifi_fe_apb, 0);
+    MemoryRegion *wifi_fe2_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_fe2_apb, OBJECT(wifi), "esp32.fe2-apb",
+                             sysbus_mmio_get_region(sbd, 3), 0,
+                             ESP32_WIFI_FE2_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x60005000, wifi_fe2_apb, 0);
 }
 
 static void esp32_machine_init_openeth(Esp32SocState *ss)
@@ -826,8 +1204,8 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_i2c(ss);
 
+    esp32_machine_init_wifi(ss, ms);
     esp32_machine_init_openeth(ss);
 
     esp32_machine_init_sd(ss);
@@ -925,18 +1303,26 @@ static ram_addr_t esp32_fixup_ram_size(ram_addr_t requested_size)
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
     mc->desc = "Espressif ESP32 machine";
     mc->init = esp32_machine_init;
     mc->max_cpus = 2;
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
     mc->fixup_ram_size = esp32_fixup_ram_size;
+    object_class_property_add_str(oc, "wifi-peer-ssid",
+                                  esp32_machine_get_wifi_peer_ssid,
+                                  esp32_machine_set_wifi_peer_ssid);
+    object_class_property_add_str(oc, "wifi-peer-password",
+                                  esp32_machine_get_wifi_peer_password,
+                                  esp32_machine_set_wifi_peer_password);
 }
 
 static const TypeInfo esp32_info = {
     .name = TYPE_ESP32_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Esp32MachineState),
+    .instance_init = esp32_machine_instance_init,
     .class_init = esp32_machine_class_init,
 };
 

@@ -74,6 +74,10 @@ typedef struct Esp32DportState {
     uint32_t cpuperiod_sel;
     uint32_t cache_ill_trap_en_reg;
     uint32_t slave_spi_config_reg;
+    uint32_t perip_clk_en;
+    uint32_t perip_rst_en;
+    qemu_irq perip_clock[32];
+    qemu_irq perip_reset[32];
 
 } Esp32DportState;
 
@@ -85,6 +89,11 @@ void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
 #define ESP32_DPORT_CACHE_ILL_IRQ_GPIO  "cache-ill-irq"
 #define ESP32_DPORT_FLASH_ENC_EN_GPIO   "flash-enc-en"
 #define ESP32_DPORT_FLASH_DEC_EN_GPIO   "flash-dec-en"
+#define ESP32_DPORT_PERIP_CLOCK_GPIO    "periph-clock"
+#define ESP32_DPORT_PERIP_RESET_GPIO    "periph-reset"
+
+REG32(DPORT_PERIP_CLK_EN, 0xc0)
+REG32(DPORT_PERIP_RST_EN, 0xc4)
 
 
 REG32(DPORT_APPCPU_RESET, 0x2c)
@@ -175,4 +184,3 @@ REG32(DPORT_CACHE_IA_INT_EN, 0x5A0)
 #define ESP32_DPORT_PRO_INTMATRIX_BASE    A_DPORT_PRO_MAC_INTR_MAP
 #define ESP32_DPORT_APP_INTMATRIX_BASE    A_DPORT_APP_MAC_INTR_MAP
 #define ESP32_DPORT_CROSSCORE_INT_BASE    A_DPORT_CPU_INTR_FROM_CPU_0
-

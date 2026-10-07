@@ -11,6 +11,7 @@
 #include "qemu/log.h"
 #include "qemu/error-report.h"
 #include "qapi/error.h"
+#include "migration/vmstate.h"
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/irq.h"
@@ -62,6 +63,10 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
     Esp32DportState *s = ESP32_DPORT(opaque);
     uint64_t r = 0;
     switch (addr) {
+    case A_DPORT_PERIP_CLK_EN:
+        return s->perip_clk_en;
+    case A_DPORT_PERIP_RST_EN:
+        return s->perip_rst_en;
     case A_DPORT_APPCPU_RESET:
         r = s->appcpu_reset_state;
         break;
@@ -134,6 +139,18 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
     bool old_state;
     uint32_t old_val;
     switch (addr) {
+    case A_DPORT_PERIP_CLK_EN:
+        s->perip_clk_en = value;
+        for (unsigned i = 0; i < 32; i++) {
+            qemu_set_irq(s->perip_clock[i], (value >> i) & 1);
+        }
+        break;
+    case A_DPORT_PERIP_RST_EN:
+        s->perip_rst_en = value;
+        for (unsigned i = 0; i < 32; i++) {
+            qemu_set_irq(s->perip_reset[i], (value >> i) & 1);
+        }
+        break;
     case A_DPORT_APPCPU_RESET:
         old_state = s->appcpu_reset_state;
         s->appcpu_reset_state = value & 1;
@@ -373,6 +390,12 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->appcpu_reset_state = true;
     s->appcpu_stall_state = false;
     s->cache_ill_trap_en_reg = 0;
+    s->perip_clk_en = 0xf9c1e06f;
+    s->perip_rst_en = 0;
+    for (unsigned i = 0; i < 32; i++) {
+        qemu_set_irq(s->perip_reset[i], 0);
+        qemu_set_irq(s->perip_clock[i], (s->perip_clk_en >> i) & 1);
+    }
     esp32_cache_reset(&s->cache_state[0]);
     esp32_cache_reset(&s->cache_state[1]);
     qemu_irq_lower(s->appcpu_stall_req);
@@ -443,12 +466,40 @@ static void esp32_dport_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(sbd), &s->cache_ill_irq, ESP32_DPORT_CACHE_ILL_IRQ_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->flash_enc_en_gpio, ESP32_DPORT_FLASH_ENC_EN_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->flash_dec_en_gpio, ESP32_DPORT_FLASH_DEC_EN_GPIO, 1);
+    qdev_init_gpio_out_named(DEVICE(sbd), s->perip_clock, ESP32_DPORT_PERIP_CLOCK_GPIO, 32);
+    qdev_init_gpio_out_named(DEVICE(sbd), s->perip_reset, ESP32_DPORT_PERIP_RESET_GPIO, 32);
 }
 
 static Property esp32_dport_properties[] = {
     DEFINE_PROP_DRIVE("flash", Esp32DportState, flash_blk),
     DEFINE_PROP_BOOL("has_psram", Esp32DportState, has_psram, false),
     DEFINE_PROP_END_OF_LIST(),
+};
+
+/* Preserve the clock/reset dependency of the new I2C/I2S models. Upstream's
+ * remaining DPORT/cache and RTC state still needs a separate whole-machine
+ * migration implementation; this description does not claim to provide it. */
+static int dport_peripherals_post_load(void *opaque, int version)
+{
+    Esp32DportState *s = opaque;
+
+    for (unsigned i = 0; i < 32; i++) {
+        qemu_set_irq(s->perip_reset[i], (s->perip_rst_en >> i) & 1);
+        qemu_set_irq(s->perip_clock[i], (s->perip_clk_en >> i) & 1);
+    }
+    return 0;
+}
+
+static const VMStateDescription vmstate_dport_peripherals = {
+    .name = "misc.esp32.dport/peripheral-clock",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = dport_peripherals_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_UINT32(perip_clk_en, Esp32DportState),
+        VMSTATE_UINT32(perip_rst_en, Esp32DportState),
+        VMSTATE_END_OF_LIST()
+    },
 };
 
 static void esp32_dport_class_init(ObjectClass *klass, void *data)
@@ -458,6 +509,7 @@ static void esp32_dport_class_init(ObjectClass *klass, void *data)
 
     rc->phases.hold = esp32_dport_reset_hold;
     dc->realize = esp32_dport_realize;
+    dc->vmsd = &vmstate_dport_peripherals;
     device_class_set_props(dc, esp32_dport_properties);
 }
 
