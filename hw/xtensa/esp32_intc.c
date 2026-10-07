@@ -45,6 +45,13 @@ static void esp32_intmatrix_irq_handler(void *opaque, int n, int level)
 {
     Esp32IntMatrixState *s = opaque;
     for (unsigned cpu = 0; cpu < ESP32_CPU_COUNT; cpu++) {
+        /* Sources deliver levels, not retrigger requests. GPIO pad edges
+         * often publish the same deasserted IRQ; rescanning every output
+         * then calling every CPU input adds no hardware transition. MMIO
+         * remapping and post-load/reset still explicitly drive outputs. */
+        if (s->source_level[cpu][n] == !!level) {
+            continue;
+        }
         s->source_level[cpu][n] = !!level;
         esp32_intmatrix_update(s, cpu);
     }
@@ -55,6 +62,9 @@ static void esp32_intmatrix_cpu_irq(void *opaque, int n, int level)
     Esp32IntMatrixState *s = opaque;
     unsigned cpu = n / ESP32_INT_MATRIX_INPUTS;
     unsigned source = n % ESP32_INT_MATRIX_INPUTS;
+    if (s->source_level[cpu][source] == !!level) {
+        return;
+    }
     s->source_level[cpu][source] = !!level;
     esp32_intmatrix_update(s, cpu);
 }

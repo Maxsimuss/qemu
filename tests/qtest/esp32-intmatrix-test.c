@@ -73,10 +73,52 @@ static void gpio_per_core(void)
     qtest_quit(q);
 }
 
+static void repeated_input_levels(void)
+{
+    QTestState *q = setup();
+    qtest_writel(q, MATRIX + 32 * 4, 1);
+    qtest_writel(q, APP_MATRIX + 32 * 4, 2);
+    qtest_set_irq_in(q, PATH, NULL, 32, 1);
+    qtest_set_irq_in(q, PATH, NULL, 32, 1);
+    g_assert_true(qtest_get_irq(q, 1));
+    g_assert_true(qtest_get_irq(q, 34));
+
+    /* A shared input must still update a core whose independent source
+     * changed even when the other core already has that level. */
+    qtest_set_irq_in(q, PATH, "cpu-source", 32, 0);
+    g_assert_false(qtest_get_irq(q, 1));
+    g_assert_true(qtest_get_irq(q, 34));
+    qtest_set_irq_in(q, PATH, NULL, 32, 1);
+    g_assert_true(qtest_get_irq(q, 1));
+    g_assert_true(qtest_get_irq(q, 34));
+
+    /* Routing an asserted source requires output updates without a new
+     * peripheral level transition. */
+    qtest_writel(q, MATRIX + 32 * 4, 3);
+    qtest_writel(q, APP_MATRIX + 32 * 4, 4);
+    qtest_set_irq_in(q, PATH, NULL, 32, 1);
+    g_assert_false(qtest_get_irq(q, 1));
+    g_assert_false(qtest_get_irq(q, 34));
+    g_assert_true(qtest_get_irq(q, 3));
+    g_assert_true(qtest_get_irq(q, 36));
+    qtest_set_irq_in(q, PATH, NULL, 32, 0);
+    qtest_set_irq_in(q, PATH, NULL, 32, 0);
+    g_assert_false(qtest_get_irq(q, 3));
+    g_assert_false(qtest_get_irq(q, 36));
+    qtest_set_irq_in(q, PATH, NULL, 32, 1);
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    qtest_clock_step(q, 0);
+    qtest_set_irq_in(q, PATH, NULL, 32, 0);
+    g_assert_false(qtest_get_irq(q, 3));
+    g_assert_false(qtest_get_irq(q, 36));
+    qtest_quit(q);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/esp32/interrupt/shared-level-remap-reset", shared_levels);
     g_test_add_func("/esp32/interrupt/gpio-per-core", gpio_per_core);
+    g_test_add_func("/esp32/interrupt/repeated-input-levels", repeated_input_levels);
     return g_test_run();
 }

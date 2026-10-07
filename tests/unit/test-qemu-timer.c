@@ -41,6 +41,11 @@ void icount_start_warp_timer(void)
     }
 }
 
+unsigned icount_process_idle_timers(bool (*pending_work)(void))
+{
+    g_assert_not_reached();
+}
+
 bool icount_configure(QemuOpts *opts, Error **errp)
 {
     g_assert_not_reached();

@@ -288,6 +288,11 @@ static void icount_timer_cb(void *opaque)
     icount_warp_rt();
 }
 
+bool icount_sleep_enabled(void)
+{
+    return icount_sleep;
+}
+
 void icount_start_warp_timer(void)
 {
     int64_t clock;

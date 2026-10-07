@@ -32,7 +32,7 @@ qtests_generic = [
   'netdev-socket',
 ]
 qtests_xtensa = (config_all_devices.has_key('CONFIG_XTENSA_ESP32') ?
-                ['esp32-i2c-test', 'esp32-i2s-test', 'esp32-gpio-test', 'esp32-intmatrix-test'] : [])
+                ['esp32-apll-test', 'esp32-i2c-test', 'esp32-i2s-test', 'esp32-i2s-dac-test', 'esp32-gpio-test', 'esp32-intmatrix-test'] : [])
 if enable_modules
   qtests_generic += [ 'modules-test' ]
 endif

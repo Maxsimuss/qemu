@@ -141,6 +141,7 @@ static void stop_engine(Esp32I2CState *s, uint32_t interrupt)
 {
     timer_del(s->timer);
     timer_del(s->sample_timer);
+    timer_del(s->timeout_timer);
     s->active = false;
     s->phase = P_HALTED;
     REG(s, A_I2C_CTR) &= ~CTL_START;
@@ -392,6 +393,12 @@ static void esp32_i2c_command(Esp32I2CState *s)
     case I2C_OPCODE_WRITE:
     case I2C_OPCODE_READ:
         if (!s->remaining) {
+            /* TRM v5.8 section21.3.4 specifies byte_num=1..255. Do not
+             * turn an undocumented zero-length command into a successful
+             * one-byte transfer merely because an SDK emits it. */
+            warn_report_once("esp32-i2c: capability gap: zero-length READ/WRITE "
+                             "is outside the specified command range; "
+                             "silicon behavior is unverified");
             qemu_log_mask(LOG_GUEST_ERROR, "esp32-i2c: zero-length command\n");
             stop_engine(s, 0);
         } else {
@@ -411,6 +418,7 @@ static void esp32_i2c_command(Esp32I2CState *s)
         s->phase = P_IDLE;
         REG(s, A_I2C_CTR) &= ~CTL_START;
         drive(s, true, false);
+        timer_del(s->timeout_timer);
         s->int_raw |= IRQ_END;
         update_irq(s);
         break;
@@ -846,6 +854,7 @@ static void trans_start(Esp32I2CState *s)
     if ((REG(s, A_I2C_CTR) & CTL_START) && master(s) && !s->active &&
         s->enabled && s->apb_freq) {
         s->active = true;
+        timer_del(s->timeout_timer);
         s->cmd_index = 0;
         s->arb_lost = s->timed_out = s->error_stop = false;
         if (!s->owns_bus) {

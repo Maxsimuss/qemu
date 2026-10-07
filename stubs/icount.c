@@ -26,6 +26,14 @@ void icount_account_warp_timer(void)
 {
     abort();
 }
+unsigned icount_process_idle_timers(bool (*pending_work)(void))
+{
+    return 0;
+}
+bool icount_idle_timers_running(void)
+{
+    return false;
+}
 void icount_notify_exit(void)
 {
     abort();
