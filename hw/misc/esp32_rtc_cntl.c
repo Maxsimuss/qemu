@@ -18,8 +18,10 @@
 #include "hw/sysbus.h"
 #include "hw/irq.h"
 #include "hw/qdev-properties.h"
+#include "migration/vmstate.h"
 #include "hw/misc/esp32_reg.h"
 #include "hw/misc/esp32_rtc_cntl.h"
+#include "hw/nvram/esp32_efuse.h"
 
 static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState* s);
 static void esp32_rtc_update_clk(Esp32RtcCntlState* s);
@@ -27,6 +29,243 @@ static void esp32_rtc_update_clk(Esp32RtcCntlState* s);
 /* TRM v5.8 Register 9.11: documented power bits; 29, 25 and 22..0 reserved. */
 #define ESP32_RTC_ANA_CONF_MASK 0xdd800000u
 #define ESP32_RTC_ANA_CONF_RESET 0x00800000u
+
+#define ESP32_ANA_I2C_BASE       0x6000e000u
+#define ESP32_ANA_CONFIG_ADDR    0x6000e044u
+#define ESP32_ANA_I2C_HOSTS      8
+#define ESP32_ANA_I2C_BUSY       BIT(25)
+#define ESP32_ANA_I2C_WRITE      BIT(24)
+#define ESP32_APLL_BLOCK         0x6d
+#define ESP32_APLL_CAL_END       BIT(7)
+#define ESP32_APLL_CAL_DELAY_NS  10000 /* explicitly unverified approximation */
+
+static bool esp32_apll_bus_enabled(Esp32RtcCntlState *s)
+{
+    return !(s->ana_config_reg & BIT(14));
+}
+
+static uint32_t esp32_apll_frequency_from_regs(Esp32RtcCntlState *s)
+{
+    Esp32EfuseState *efuse = esp32_efuse_find();
+    bool rev0 = !efuse || !(efuse->efuse_rd.blk0[3] & BIT(15));
+    return esp32_apll_compute_hz(s->xtal_apb_freq,
+                                 s->apll_analog[9], s->apll_analog[8],
+                                 s->apll_analog[7], s->apll_analog[4] & 0x1f,
+                                 rev0);
+}
+
+static void esp32_apll_calibration_timer(void *opaque)
+{
+    Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+    s->apll_calibrating = false;
+    if (s->apll_cal_valid && esp32_rtc_apll_enabled(s)) {
+        s->apll_analog[3] |= ESP32_APLL_CAL_END;
+    }
+    esp32_rtc_update_clk(s);
+}
+
+static uint64_t esp32_ana_i2c_read(void *opaque, hwaddr addr, unsigned size);
+static void esp32_ana_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size);
+
+static void esp32_ana_i2c_complete(Esp32RtcCntlState *s)
+{
+    uint32_t cmd = s->ana_i2c_last_cmd;
+    unsigned host = s->ana_i2c_pending_host;
+    unsigned block = (cmd >> 0) & 0xff;
+    unsigned reg = (cmd >> 8) & 0xff;
+    uint8_t data = (cmd >> 16) & 0xff;
+
+    block = cmd & 0xff;
+    reg = (cmd >> 8) & 0xff;
+    data = (cmd >> 16) & 0xff;
+    if (block != ESP32_APLL_BLOCK || host != 3) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32: unsupported analog-I2C host %u block 0x%02x\n",
+                      host, block);
+        s->ana_i2c_cmd[host] = 0;
+        return;
+    }
+    if (!esp32_apll_bus_enabled(s)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32: APLL analog-I2C access while bus is reset\n");
+        s->ana_i2c_cmd[host] = 0;
+        return;
+    }
+    if (reg >= ARRAY_SIZE(s->apll_analog)) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32: invalid APLL analog register 0x%02x\n", reg);
+        s->ana_i2c_cmd[host] = 0;
+        return;
+    }
+
+    if (cmd & ESP32_ANA_I2C_WRITE) {
+        uint8_t old = s->apll_analog[reg];
+        static const uint8_t write_mask[] = {
+            0xff, 0x7f, 0xff, 0x00, 0xdf, 0x7f, 0x1f, 0x3f, 0xff, 0xff,
+        };
+        s->apll_analog[reg] = (old & ~write_mask[reg]) |
+                              (data & write_mask[reg]);
+        if (reg == 0) {
+            bool started = !(old & BIT(5)) &&
+                           (s->apll_analog[reg] & BIT(5));
+            bool reset_asserted = !(s->apll_analog[reg] & BIT(4));
+            if (reset_asserted) {
+                s->apll_analog[3] &= ~ESP32_APLL_CAL_END;
+                s->apll_calibrating = false;
+                timer_del(s->apll_cal_timer);
+            }
+            if (started) {
+                s->apll_cal_valid = (s->apll_analog[0] & BIT(4)) &&
+                                    (s->apll_analog[5] & BIT(6)) &&
+                                    esp32_apll_frequency_from_regs(s) != 0;
+                s->apll_calibrating = s->apll_cal_valid;
+                if (s->apll_calibrating) {
+                    if (!s->apll_model_warned) {
+                        qemu_log_mask(LOG_UNIMP,
+                                      "esp32: APLL CAL_END timing (10 us) and analog CAP/UDF/OVF are unverified model approximations\n");
+                        s->apll_model_warned = true;
+                    }
+                    s->apll_cal_deadline_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                                              ESP32_APLL_CAL_DELAY_NS;
+                    timer_mod(s->apll_cal_timer, s->apll_cal_deadline_ns);
+                }
+            }
+            if (started || reset_asserted) {
+                esp32_rtc_update_clk(s);
+            }
+        } else if (reg == 4 || reg == 7 || reg == 8 || reg == 9) {
+            /* A coefficient change invalidates an earlier completion. */
+            s->apll_analog[3] &= ~ESP32_APLL_CAL_END;
+            s->apll_calibrating = false;
+            timer_del(s->apll_cal_timer);
+            esp32_rtc_update_clk(s);
+        }
+    } else {
+        data = s->apll_analog[reg] & 0xff;
+    }
+    s->ana_i2c_cmd[host] = ((uint32_t)data << 16) | (cmd & 0xffff);
+}
+
+static void esp32_ana_i2c_timer(void *opaque)
+{
+    Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+    if (!s->ana_i2c_pending) {
+        return;
+    }
+    s->ana_i2c_pending = false;
+    esp32_ana_i2c_complete(s);
+}
+
+static uint64_t esp32_ana_mmio_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+    if (addr == 0x44) {
+        return s->ana_config_reg;
+    }
+    return esp32_ana_i2c_read(opaque, addr, size);
+}
+
+static void esp32_ana_mmio_write(void *opaque, hwaddr addr, uint64_t value,
+                                 unsigned size)
+{
+    Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+    if (addr == 0x44) {
+        s->ana_config_reg = value & (0x3ffu << 8);
+        if (s->ana_config_reg & BIT(14)) {
+            if (s->ana_i2c_pending) {
+                s->ana_i2c_pending = false;
+                timer_del(s->ana_i2c_timer);
+                s->ana_i2c_cmd[s->ana_i2c_pending_host] = 0;
+            }
+        }
+        return;
+    }
+    esp32_ana_i2c_write(opaque, addr, value, size);
+}
+
+static uint64_t esp32_ana_i2c_read(void *opaque, hwaddr addr, unsigned size)
+{
+    Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+    unsigned host = addr / 4;
+    if (host >= ESP32_ANA_I2C_HOSTS) {
+        return 0;
+    }
+    return s->ana_i2c_cmd[host];
+}
+
+static void esp32_ana_i2c_write(void *opaque, hwaddr addr, uint64_t value,
+                                unsigned size)
+{
+    Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
+    unsigned host = addr / 4;
+    if (host >= ESP32_ANA_I2C_HOSTS) {
+        return;
+    }
+    if (s->ana_i2c_pending) {
+        qemu_log_mask(LOG_GUEST_ERROR,
+                      "esp32: analog-I2C command issued while host is busy\n");
+        return;
+    }
+    s->ana_i2c_last_cmd = value & 0x01ffffff;
+    s->ana_i2c_pending_host = host;
+    s->ana_i2c_cmd[host] = s->ana_i2c_last_cmd | ESP32_ANA_I2C_BUSY;
+    s->ana_i2c_pending = true;
+    timer_mod(s->ana_i2c_timer,
+              qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 1000);
+}
+
+static const MemoryRegionOps esp32_ana_mmio_ops = {
+    .read = esp32_ana_mmio_read,
+    .write = esp32_ana_mmio_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+};
+
+static int esp32_rtc_cntl_post_load(void *opaque, int version_id)
+{
+    Esp32RtcCntlState *s = opaque;
+    if (s->ana_i2c_pending != timer_pending(s->ana_i2c_timer) ||
+        s->apll_calibrating != timer_pending(s->apll_cal_timer)) {
+        return -EINVAL;
+    }
+    if (!esp32_rtc_apll_enabled(s) ||
+        !s->apll_cal_valid) {
+        s->apll_analog[3] &= ~ESP32_APLL_CAL_END;
+    }
+    esp32_rtc_update_clk(s);
+    return 0;
+}
+
+static const VMStateDescription vmstate_esp32_rtc_cntl = {
+    .name = TYPE_ESP32_RTC_CNTL,
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .post_load = esp32_rtc_cntl_post_load,
+    .fields = (const VMStateField[]) {
+        VMSTATE_TIMER_PTR(ana_i2c_timer, Esp32RtcCntlState),
+        VMSTATE_TIMER_PTR(apll_cal_timer, Esp32RtcCntlState),
+        VMSTATE_UINT32(ana_config_reg, Esp32RtcCntlState),
+        VMSTATE_UINT32(ana_conf_reg, Esp32RtcCntlState),
+        VMSTATE_UINT32(xtal_apb_freq, Esp32RtcCntlState),
+        VMSTATE_UINT32(pll_apb_freq, Esp32RtcCntlState),
+        VMSTATE_UINT32(soc_clk, Esp32RtcCntlState),
+        VMSTATE_UINT32(rtc_fastclk, Esp32RtcCntlState),
+        VMSTATE_UINT32(rtc_fastclk_freq, Esp32RtcCntlState),
+        VMSTATE_UINT32(rtc_slowclk, Esp32RtcCntlState),
+        VMSTATE_UINT32(rtc_slowclk_freq, Esp32RtcCntlState),
+        VMSTATE_UINT32_ARRAY(ana_i2c_cmd, Esp32RtcCntlState,
+                             ESP32_ANA_I2C_HOSTS),
+        VMSTATE_UINT32_ARRAY(apll_analog, Esp32RtcCntlState, 10),
+        VMSTATE_UINT32(ana_i2c_last_cmd, Esp32RtcCntlState),
+        VMSTATE_UINT8(ana_i2c_pending_host, Esp32RtcCntlState),
+        VMSTATE_BOOL(ana_i2c_pending, Esp32RtcCntlState),
+        VMSTATE_BOOL(apll_calibrating, Esp32RtcCntlState),
+        VMSTATE_BOOL(apll_cal_valid, Esp32RtcCntlState),
+        VMSTATE_BOOL(apll_model_warned, Esp32RtcCntlState),
+        VMSTATE_INT64(apll_cal_deadline_ns, Esp32RtcCntlState),
+        VMSTATE_END_OF_LIST()
+    },
+};
 
 uint32_t esp32_apll_compute_hz(uint32_t xtal_hz, unsigned sdm0, unsigned sdm1,
                                unsigned sdm2, unsigned odiv, bool rev0)
@@ -71,11 +310,47 @@ bool esp32_rtc_apll_enabled(const Esp32RtcCntlState *s)
 
 uint32_t esp32_rtc_get_apll_hz(Esp32RtcCntlState *s)
 {
-    if (!esp32_rtc_apll_enabled(s)) {
+    uint64_t numerator, denominator;
+    if (!esp32_rtc_get_apll_rate(s, &numerator, &denominator)) {
         return 0;
     }
-    return esp32_apll_compute_hz(s->apll_xtal_hz, s->apll_sdm0, s->apll_sdm1,
-                                 s->apll_sdm2, s->apll_odiv, s->apll_rev0);
+    return numerator / denominator;
+}
+
+bool esp32_rtc_get_apll_rate(Esp32RtcCntlState *s, uint64_t *numerator,
+                             uint64_t *denominator)
+{
+    if (!esp32_rtc_apll_enabled(s) ||
+        !(s->apll_analog[3] & ESP32_APLL_CAL_END)) {
+        return false;
+    }
+    unsigned sdm0 = s->apll_analog[9];
+    unsigned sdm1 = s->apll_analog[8];
+    unsigned sdm2 = s->apll_analog[7];
+    unsigned odiv = s->apll_analog[4] & 0x1f;
+    Esp32EfuseState *efuse = esp32_efuse_find();
+    bool rev0 = !efuse || !(efuse->efuse_rd.blk0[3] & BIT(15));
+    if (rev0) {
+        sdm0 = sdm1 = 0;
+    }
+    uint64_t cfg = ((uint64_t)(4 + sdm2) << 16) |
+                   ((uint64_t)sdm1 << 8) | sdm0;
+    uint64_t num = (uint64_t)s->xtal_apb_freq * cfg;
+    uint64_t den = (uint64_t)65536 * 2 * (odiv + 2);
+    if (!esp32_apll_compute_hz(s->xtal_apb_freq, sdm0, sdm1,
+                              sdm2, odiv, false)) {
+        return false;
+    }
+    uint64_t gcd = num;
+    uint64_t rem = den;
+    while (rem) {
+        uint64_t next = gcd % rem;
+        gcd = rem;
+        rem = next;
+    }
+    *numerator = num / gcd;
+    *denominator = den / gcd;
+    return true;
 }
 
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
@@ -177,6 +452,11 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
 
     case A_RTC_CNTL_ANA_CONF:
         s->ana_conf_reg = value & ESP32_RTC_ANA_CONF_MASK;
+        if (s->ana_conf_reg & BIT(23)) {
+            s->apll_analog[3] &= ~ESP32_APLL_CAL_END;
+            s->apll_calibrating = false;
+            timer_del(s->apll_cal_timer);
+        }
         esp32_rtc_update_clk(s);
         break;
 
@@ -246,6 +526,14 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
 
     s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
     s->ana_conf_reg = ESP32_RTC_ANA_CONF_RESET;
+    s->ana_config_reg = 0x3ffu << 8;
+    memset(s->ana_i2c_cmd, 0, sizeof(s->ana_i2c_cmd));
+    memset(s->apll_analog, 0, sizeof(s->apll_analog));
+    s->ana_i2c_pending = false;
+    s->apll_calibrating = false;
+    s->apll_cal_valid = false;
+    timer_del(s->ana_i2c_timer);
+    timer_del(s->apll_cal_timer);
 }
 
 static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
@@ -266,6 +554,13 @@ static void esp32_rtc_cntl_init(Object *obj)
     memory_region_init_io(&s->iomem, obj, &esp32_rtc_cntl_ops, s,
                           TYPE_ESP32_RTC_CNTL, ESP32_RTC_CNTL_SIZE);
     sysbus_init_mmio(sbd, &s->iomem);
+    memory_region_init_io(&s->ana_i2c_iomem, obj, &esp32_ana_mmio_ops, s,
+                          "esp32.ana_i2c", 0x48);
+    sysbus_init_mmio(sbd, &s->ana_i2c_iomem);
+    s->ana_i2c_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                    esp32_ana_i2c_timer, s);
+    s->apll_cal_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                     esp32_apll_calibration_timer, s);
     sysbus_init_irq(sbd, &s->irq);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->dig_reset_req, ESP32_RTC_DIG_RESET_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), &s->cpu_reset_req[0], ESP32_RTC_CPU_RESET_GPIO, ESP32_CPU_COUNT);
@@ -280,20 +575,16 @@ static void esp32_rtc_cntl_init(Object *obj)
     s->rtc_slowclk = ESP32_SLOW_CLK_RC;
     s->rtc_fastclk = ESP32_FAST_CLK_8M;
     s->soc_clk = ESP32_SOC_CLK_XTAL;
-    s->xtal_apb_freq = 40000000;
     s->pll_apb_freq = 80000000;
     s->ana_conf_reg = ESP32_RTC_ANA_CONF_RESET;
+    s->ana_config_reg = 0x3ffu << 8;
     esp32_rtc_update_clk(s);
 }
 
 static Property esp32_rtc_cntl_properties[] = {
-    DEFINE_PROP_UINT32("apll-sdm0", Esp32RtcCntlState, apll_sdm0, 0),
-    DEFINE_PROP_UINT32("apll-sdm1", Esp32RtcCntlState, apll_sdm1, 0),
-    DEFINE_PROP_UINT32("apll-sdm2", Esp32RtcCntlState, apll_sdm2, 0),
-    DEFINE_PROP_UINT32("apll-odiv", Esp32RtcCntlState, apll_odiv, 0),
-    DEFINE_PROP_UINT32("apll-xtal-hz", Esp32RtcCntlState, apll_xtal_hz,
+    /* One crystal reference feeds RTC, APLL, APB and peripherals. */
+    DEFINE_PROP_UINT32("xtal-apb-freq", Esp32RtcCntlState, xtal_apb_freq,
                        40000000),
-    DEFINE_PROP_BOOL("apll-rev0", Esp32RtcCntlState, apll_rev0, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -305,6 +596,7 @@ static void esp32_rtc_cntl_class_init(ObjectClass *klass, void *data)
     rc->phases.hold = esp32_rtc_cntl_reset_hold;
     rc->phases.exit = esp32_rtc_cntl_reset_exit;
     dc->realize = esp32_rtc_cntl_realize;
+    dc->vmsd = &vmstate_esp32_rtc_cntl;
     device_class_set_props(dc, esp32_rtc_cntl_properties);
 }
 

@@ -1,8 +1,5 @@
-/* ESP32 APLL fixture regressions: TRM v5.8 sections 7.2, 7.2.7, 9.11, 22.3.
- * RTC ANA_CONF power bits, the fout formula ranges, and I2S BCK derived from
- * the APLL source are exercised on resolved pads. Coefficient programming via
- * the internal analog bus is undocumented in the TRM, so coefficients arrive
- * as machine properties; this file certifies its covered cases only.
+/* ESP32 APLL regressions: resolved pads and downstream clock consumers are
+ * driven by the same guest-visible analog-I2C commands used by the ROM/SDK.
  * SPDX-License-Identifier: GPL-2.0-or-later
  */
 #include "qemu/osdep.h"
@@ -63,8 +60,10 @@
 
 /* APLL fixture: fout = 40 MHz * (4 + 5) / (2 * (4 + 2)) = 30 MHz.
  * With N = 15 and M = 8: fi2s = 2 MHz, BCK = 250 kHz, half period 2000 ns. */
-#define APLL_GLOBALS " -global driver=misc.esp32.rtc_cntl,property=apll-sdm2,value=5" \
-                     " -global driver=misc.esp32.rtc_cntl,property=apll-odiv,value=4"
+#define ANA_I2C_BASE 0x6000e000
+#define ANA_CONFIG 0x6000e044
+#define APLL_HOST 3
+#define APLL_BLOCK 0x6d
 #define APLL_CLKM_DIV_NUM 15
 #define APLL_BCK_DIV 8
 #define APLL_BCK_HALF_NS 2000
@@ -77,6 +76,59 @@ static QTestState *boot(const char *extra)
                                             "-serial none -nic none%s",
                                             extra ? extra : "");
     return qtest_init(args);
+}
+
+static void ana_i2c_write(QTestState *q, unsigned reg, uint8_t data)
+{
+    uint32_t cmd = (1u << 24) | ((uint32_t)data << 16) |
+                   (reg << 8) | APLL_BLOCK;
+    qtest_writel(q, ANA_I2C_BASE + 4 * APLL_HOST, cmd);
+    for (unsigned i = 0; i < 8; i++) {
+        if (!(qtest_readl(q, ANA_I2C_BASE + 4 * APLL_HOST) & (1u << 25))) {
+            return;
+        }
+        qtest_clock_step(q, 1000);
+    }
+    g_assert_not_reached();
+}
+
+static uint8_t ana_i2c_read(QTestState *q, unsigned reg)
+{
+    uint32_t cmd = (reg << 8) | APLL_BLOCK;
+    qtest_writel(q, ANA_I2C_BASE + 4 * APLL_HOST, cmd);
+    for (unsigned i = 0; i < 8; i++) {
+        uint32_t result = qtest_readl(q, ANA_I2C_BASE + 4 * APLL_HOST);
+        if (!(result & (1u << 25))) {
+            return result >> 16;
+        }
+        qtest_clock_step(q, 1000);
+    }
+    g_assert_not_reached();
+    return 0;
+}
+
+static void program_apll(QTestState *q, unsigned sdm0, unsigned sdm1,
+                         unsigned sdm2, unsigned odiv)
+{
+    /* ANA_CONFIG defaults to reset asserted for all analog I2C hosts. */
+    qtest_writel(q, ANA_CONFIG, (0x3ffu << 8) & ~(1u << 14));
+    ana_i2c_write(q, 4, odiv);
+    ana_i2c_write(q, 5, 0x69);
+    ana_i2c_write(q, 7, sdm2);
+    ana_i2c_write(q, 8, sdm1);
+    ana_i2c_write(q, 9, sdm0);
+    ana_i2c_write(q, 0, 0x0f);
+    ana_i2c_write(q, 0, 0x3f);
+    ana_i2c_write(q, 0, 0x1f);
+    for (unsigned i = 0; i < 8 && !(ana_i2c_read(q, 3) & 0x80); i++) {
+        qtest_clock_step(q, 10000);
+    }
+    g_assert_true(ana_i2c_read(q, 3) & 0x80);
+}
+
+static void program_default_apll(QTestState *q)
+{
+    program_apll(q, 0, 0, 5, 4);
 }
 
 static bool pad_level(QTestState *q, unsigned pad)
@@ -130,7 +182,8 @@ static void ana_conf_reset_mask(void)
 
 static void tx_on_apll(void)
 {
-    QTestState *q = boot(APLL_GLOBALS);
+    QTestState *q = boot(NULL);
+    program_default_apll(q);
     qtest_writel(q, RTC_ANA_CONF, RTC_PLLA_FORCE_PU);
     route_tx_pins(q);
     start_tx(q, I2S_CLKA_ENA | I2S_CLK_EN | APLL_CLKM_DIV_NUM);
@@ -176,7 +229,8 @@ static void tx_without_source(QTestState *q)
 /* Valid coefficients but power-down forced: no BCK edges. */
 static void disabled_no_clock(void)
 {
-    QTestState *q = boot(APLL_GLOBALS);
+    QTestState *q = boot(NULL);
+    program_default_apll(q);
     qtest_writel(q, RTC_ANA_CONF, RTC_PLLA_FORCE_PD);
     tx_without_source(q);
 }

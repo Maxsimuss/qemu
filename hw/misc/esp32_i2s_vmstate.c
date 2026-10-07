@@ -144,6 +144,8 @@ const VMStateDescription vmstate_esp32_i2s = {
         VMSTATE_BOOL(mclk_level, Esp32I2SState),
         VMSTATE_BOOL(enabled, Esp32I2SState),
         VMSTATE_UINT32(apll_hz, Esp32I2SState),
+        VMSTATE_UINT64(apll_numerator, Esp32I2SState),
+        VMSTATE_UINT64(apll_denominator, Esp32I2SState),
         VMSTATE_UINT8_ARRAY(input_level, Esp32I2SState, 24),
         VMSTATE_END_OF_LIST()
     },

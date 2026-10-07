@@ -233,9 +233,10 @@ static void esp32_clk_update(void* opaque, int n, int level)
 
     /* Audio clock availability is independent of the CPU clock mux. In
      * particular, an invalid CPU source must not retain a stale I2S APLL. */
-    uint32_t apll_hz = esp32_rtc_get_apll_hz(&s->rtc_cntl);
+    uint64_t apll_num = 0, apll_den = 1;
+    esp32_rtc_get_apll_rate(&s->rtc_cntl, &apll_num, &apll_den);
     for (unsigned i = 0; i < 2; i++) {
-        esp32_i2s_set_apll(&s->i2s[i], apll_hz);
+        esp32_i2s_set_apll_rate(&s->i2s[i], apll_num, apll_den);
     }
 
     /* APB clock */
@@ -465,6 +466,15 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->rtc_cntl), &s->rtc_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->rtc_cntl, DR_REG_RTCCNTL_BASE);
+    /* The ROM analog-I2C command port is outside the RTC_CNTL block. It is
+     * present at the DPORT and APB aliases used by the original ESP32. */
+    MemoryRegion *ana_i2c = sysbus_mmio_get_region(SYS_BUS_DEVICE(&s->rtc_cntl), 1);
+    memory_region_add_subregion_overlap(sys_mem, 0x3ff4e000, ana_i2c, 0);
+    MemoryRegion *ana_i2c_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(ana_i2c_apb, OBJECT(&s->rtc_cntl),
+                             "esp32.ana_i2c-apb", ana_i2c, 0,
+                             memory_region_size(ana_i2c));
+    memory_region_add_subregion_overlap(sys_mem, 0x6000e000, ana_i2c_apb, 0);
 
     qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_RTC_DIG_RESET_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_DIG_RESET_GPIO, 0));
@@ -568,8 +578,9 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2s[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_I2S0_INTR_SOURCE + i));
         esp32_i2s_connect_gpio(&s->i2s[i], &s->gpio, i);
-        esp32_i2s_set_apll(&s->i2s[i],
-                           esp32_rtc_get_apll_hz(&s->rtc_cntl));
+        uint64_t apll_num = 0, apll_den = 1;
+        esp32_rtc_get_apll_rate(&s->rtc_cntl, &apll_num, &apll_den);
+        esp32_i2s_set_apll_rate(&s->i2s[i], apll_num, apll_den);
     }
     const unsigned clock_bits[] = {4, 7, 18, 21};
     for (unsigned i = 0; i < ARRAY_SIZE(clock_bits); i++) {
