@@ -557,6 +557,16 @@ void main_loop_poll_remove_notifier(Notifier *notify)
     notifier_remove(notify);
 }
 
+static bool main_loop_has_pending_work(void)
+{
+    /* Bottom halves and due AioContext timers must run through their normal
+     * dispatch before an idle clock can advance again. Host I/O is polled
+     * after the bounded batch, even if its timer callbacks never wake CPUs.
+     */
+    return aio_compute_timeout(qemu_get_aio_context()) == 0 ||
+           aio_compute_timeout(iohandler_get_aio_context()) == 0;
+}
+
 void main_loop_wait(int nonblocking)
 {
     MainLoopPoll mlpoll = {
@@ -590,6 +600,10 @@ void main_loop_wait(int nonblocking)
     mlpoll.state = ret < 0 ? MAIN_LOOP_POLL_ERR : MAIN_LOOP_POLL_OK;
     notifier_list_notify(&main_loop_poll_notifiers, &mlpoll);
 
+    if (icount_enabled() &&
+        icount_process_idle_timers(main_loop_has_pending_work)) {
+        return;
+    }
     if (icount_enabled()) {
         /*
          * CPU thread can infinitely wait for event after

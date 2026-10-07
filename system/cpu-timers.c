@@ -243,6 +243,14 @@ void qemu_timer_notify_cb(void *opaque, QEMUClockType type)
         return;
     }
 
+    if (icount_idle_timers_running()) {
+        /* The main-loop is already dispatching every virtual deadline.
+         * Only timer-only notifications are redundant here. Real IRQs and
+         * asynchronous CPU work retain their normal wake paths.
+         */
+        return;
+    }
+
     if (qemu_in_vcpu_thread()) {
         /*
          * A CPU is currently running; kick it back out to the

@@ -21,6 +21,11 @@ int64_t cpus_get_virtual_clock(void) { return virtual_time; }
 void cpus_set_virtual_clock(int64_t ns) { virtual_time = ns; }
 int64_t icount_get_raw(void) { return virtual_time; }
 void icount_start_warp_timer(void) { g_assert_not_reached(); }
+unsigned icount_process_idle_timers(bool (*pending_work)(void))
+{
+    g_assert_not_reached();
+}
+
 bool icount_configure(QemuOpts *opts, Error **errp) { g_assert_not_reached(); }
 void icount_account_warp_timer(void) { g_assert_not_reached(); }
 void icount_notify_exit(void) { g_assert_not_reached(); }
@@ -135,7 +140,8 @@ static int roundtrip(Esp32I2CState *source, Esp32I2CState *dest)
     ioc = QIO_CHANNEL(qio_channel_file_new_fd(fd));
     file = qemu_file_new_input(ioc);
     object_unref(OBJECT(ioc));
-    int result = vmstate_load_state(file, &vmstate_esp32_i2c, dest, 1);
+    int result = vmstate_load_state(file, &vmstate_esp32_i2c, dest,
+                                   vmstate_esp32_i2c.version_id);
     qemu_fclose(file);
     unlink(name);
     return result;

@@ -24,6 +24,60 @@
 static void esp32_rtc_update_cpu_stall(Esp32RtcCntlState* s);
 static void esp32_rtc_update_clk(Esp32RtcCntlState* s);
 
+/* TRM v5.8 Register 9.11: documented power bits; 29, 25 and 22..0 reserved. */
+#define ESP32_RTC_ANA_CONF_MASK 0xdd800000u
+#define ESP32_RTC_ANA_CONF_RESET 0x00800000u
+
+uint32_t esp32_apll_compute_hz(uint32_t xtal_hz, unsigned sdm0, unsigned sdm1,
+                               unsigned sdm2, unsigned odiv, bool rev0)
+{
+    if (sdm0 > 255 || sdm1 > 255 || sdm2 > 63 || odiv > 31) {
+        return 0;
+    }
+    if (rev0 && (sdm0 || sdm1)) {
+        /* ESP32 erratum CLK-3.7: these fields are ignored by revision 0,
+         * rather than making an otherwise valid APLL configuration fail. */
+        sdm0 = sdm1 = 0;
+    }
+    if (xtal_hz < 2000000 || xtal_hz > 40000000) {
+        return 0;
+    }
+    uint64_t cfg = ((uint64_t)(4 + sdm2) << 16) |
+                   ((uint64_t)sdm1 << 8) | sdm0;
+    uint64_t num = (uint64_t)xtal_hz * cfg;
+    if (num <= (uint64_t)350000000 << 16 ||
+        num >= (uint64_t)500000000 << 16) {
+        return 0;
+    }
+    uint64_t fout = num / ((uint64_t)65536 * 2 * (odiv + 2));
+    /* The TRM's overview gives 16..128 MHz, but its coefficient formula
+     * permits lower outputs at large ODIV. Official ESP-IDF clk_tree_ll.h
+     * consequently supports 5.303031..125 MHz. Do not invent a 16 MHz gate. */
+    return (uint32_t)fout;
+}
+
+bool esp32_rtc_apll_enabled(const Esp32RtcCntlState *s)
+{
+    if (s->ana_conf_reg & BIT(23)) {
+        return false;
+    }
+    if (s->ana_conf_reg & BIT(24)) {
+        return true;
+    }
+    /* Both force bits are 0: the PLL follows the system (TRM 7.2.7). Sleep
+     * is not modeled, and the active system keeps the PLL enabled. */
+    return true;
+}
+
+uint32_t esp32_rtc_get_apll_hz(Esp32RtcCntlState *s)
+{
+    if (!esp32_rtc_apll_enabled(s)) {
+        return 0;
+    }
+    return esp32_apll_compute_hz(s->apll_xtal_hz, s->apll_sdm0, s->apll_sdm1,
+                                 s->apll_sdm2, s->apll_odiv, s->apll_rev0);
+}
+
 static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size)
 {
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(opaque);
@@ -47,6 +101,10 @@ static uint64_t esp32_rtc_cntl_read(void *opaque, hwaddr addr, unsigned int size
         r = FIELD_DP32(r, RTC_CNTL_RESET_STATE, RESET_CAUSE_APPCPU, s->reset_cause[1]);
         r = FIELD_DP32(r, RTC_CNTL_RESET_STATE, PROCPU_STAT_VECTOR_SEL, s->stat_vector_sel[0]);
         r = FIELD_DP32(r, RTC_CNTL_RESET_STATE, APPCPU_STAT_VECTOR_SEL, s->stat_vector_sel[1]);
+        break;
+
+    case A_RTC_CNTL_ANA_CONF:
+        r = s->ana_conf_reg;
         break;
 
     case A_RTC_CNTL_STORE0:
@@ -117,6 +175,11 @@ static void esp32_rtc_cntl_write(void *opaque, hwaddr addr, uint64_t value,
                                            APPCPU_STAT_VECTOR_SEL);
         break;
 
+    case A_RTC_CNTL_ANA_CONF:
+        s->ana_conf_reg = value & ESP32_RTC_ANA_CONF_MASK;
+        esp32_rtc_update_clk(s);
+        break;
+
     case A_RTC_CNTL_STORE0:
     case A_RTC_CNTL_STORE1:
     case A_RTC_CNTL_STORE2:
@@ -182,6 +245,13 @@ static void esp32_rtc_cntl_reset_hold(Object *obj, ResetType type)
     Esp32RtcCntlState *s = ESP32_RTC_CNTL(obj);
 
     s->time_base_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    s->ana_conf_reg = ESP32_RTC_ANA_CONF_RESET;
+}
+
+static void esp32_rtc_cntl_reset_exit(Object *obj, ResetType type)
+{
+    /* A force-power-down reset must also invalidate downstream sources. */
+    esp32_rtc_update_clk(ESP32_RTC_CNTL(obj));
 }
 
 static void esp32_rtc_cntl_realize(DeviceState *dev, Error **errp)
@@ -212,10 +282,18 @@ static void esp32_rtc_cntl_init(Object *obj)
     s->soc_clk = ESP32_SOC_CLK_XTAL;
     s->xtal_apb_freq = 40000000;
     s->pll_apb_freq = 80000000;
+    s->ana_conf_reg = ESP32_RTC_ANA_CONF_RESET;
     esp32_rtc_update_clk(s);
 }
 
 static Property esp32_rtc_cntl_properties[] = {
+    DEFINE_PROP_UINT32("apll-sdm0", Esp32RtcCntlState, apll_sdm0, 0),
+    DEFINE_PROP_UINT32("apll-sdm1", Esp32RtcCntlState, apll_sdm1, 0),
+    DEFINE_PROP_UINT32("apll-sdm2", Esp32RtcCntlState, apll_sdm2, 0),
+    DEFINE_PROP_UINT32("apll-odiv", Esp32RtcCntlState, apll_odiv, 0),
+    DEFINE_PROP_UINT32("apll-xtal-hz", Esp32RtcCntlState, apll_xtal_hz,
+                       40000000),
+    DEFINE_PROP_BOOL("apll-rev0", Esp32RtcCntlState, apll_rev0, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -225,6 +303,7 @@ static void esp32_rtc_cntl_class_init(ObjectClass *klass, void *data)
     ResettableClass *rc = RESETTABLE_CLASS(klass);
 
     rc->phases.hold = esp32_rtc_cntl_reset_hold;
+    rc->phases.exit = esp32_rtc_cntl_reset_exit;
     dc->realize = esp32_rtc_cntl_realize;
     device_class_set_props(dc, esp32_rtc_cntl_properties);
 }

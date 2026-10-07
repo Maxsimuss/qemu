@@ -68,4 +68,6 @@ extern TimersState timers_state;
  */
 int64_t cpu_get_clock_locked(void);
 
+bool icount_sleep_enabled(void);
+
 #endif /* TIMERS_STATE_H */

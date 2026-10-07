@@ -5,6 +5,102 @@
 #include "libqtest.h"
 #define GPIO 0x3ff44000
 #define MUX 0x3ff49000
+#define DPORT 0x3ff00000
+#define I2S 0x3ff4f000
+
+static bool digital(QTestState *q, unsigned pad)
+{
+    return (qtest_readl(q, GPIO + 0x3c) >> pad) & 1;
+}
+
+static QTestState *serial_setup(void)
+{
+    QTestState *q = qtest_init("-machine esp32 -serial none -display none -nic none");
+    qtest_writel(q, DPORT + 0xc0, (1 << 4) | (1 << 21));
+    qtest_writel(q, MUX + 0x70, (2 << 12) | (1 << 9));
+    qtest_writel(q, MUX + 0x74, (2 << 12) | (1 << 9));
+    qtest_writel(q, MUX + 0x8c, (2 << 12) | (1 << 9));
+    qtest_writel(q, I2S + 0xac, (1 << 20) | 10);
+    qtest_writel(q, I2S + 0xb0, 8 | (8 << 6) | (16 << 12) | (16 << 18));
+    qtest_writel(q, I2S + 0x20, 32 | (32 << 6) | (1 << 19) | (1 << 20));
+    return q;
+}
+
+static void live_output_routing(void)
+{
+    QTestState *q = serial_setup();
+    qtest_writel(q, MUX + 0x28, (2 << 12) | (1 << 9));
+    qtest_writel(q, GPIO + 0x530 + 18 * 4, 23);
+    qtest_writel(q, GPIO + 0x530 + 26 * 4, 23);
+    qtest_writel(q, I2S, 0xa55ac33c);
+    qtest_writel(q, I2S + 8, 1 << 4);
+    qtest_clock_step(q, 250);
+    g_assert_true(digital(q, 18));
+    g_assert_true(digital(q, 26));
+    qtest_writel(q, GPIO + 0x24, (1 << 18) | (1 << 26));
+    qtest_writel(q, GPIO + 0x530 + 18 * 4, 256 | (1 << 10));
+    qtest_writel(q, GPIO + 0x530 + 26 * 4, 23 | (1 << 9));
+    g_assert_false(digital(q, 18));
+    g_assert_false(digital(q, 26));
+    qtest_clock_step(q, 250);
+    g_assert_false(digital(q, 18));
+    g_assert_true(digital(q, 26));
+    qtest_writel(q, MUX + 0x28, 1 << 9); /* native DAC is unknown */
+    qtest_clock_step(q, 250);
+    qtest_writel(q, MUX + 0x28, (2 << 12) | (1 << 9));
+    g_assert_false(digital(q, 26));
+    qtest_clock_step(q, 250);
+    g_assert_true(digital(q, 26));
+    qtest_writel(q, GPIO + 0x530 + 26 * 4, 256 | (1 << 10));
+    qtest_clock_step(q, 250); /* no pad carries BCLK, its latch still advances */
+    qtest_writel(q, GPIO + 0x530 + 18 * 4, 23);
+    g_assert_true(digital(q, 18));
+    qtest_clock_step(q, 250);
+    g_assert_false(digital(q, 18));
+    qtest_qmp_assert_success(q, "{'execute':'system_reset'}");
+    qtest_clock_step(q, 0);
+    g_assert_cmphex(qtest_readl(q, GPIO + 0x530 + 18 * 4), ==, 256);
+    g_assert_false(digital(q, 18));
+    qtest_quit(q);
+}
+
+static void receive_constant_frame(QTestState *q, uint32_t expected)
+{
+    for (unsigned bit = 0; bit < 32; bit++) {
+        qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 19, bit >= 16);
+        qtest_clock_step(q, 250);
+        qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 18, 1);
+        qtest_clock_step(q, 250);
+        qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 18, 0);
+    }
+    g_assert_cmphex(qtest_readl(q, I2S + 4), ==, expected);
+}
+
+static void live_input_routing(void)
+{
+    QTestState *q = serial_setup();
+    qtest_writel(q, MUX + 0x24, (2 << 12) | (1 << 9));
+    qtest_writel(q, GPIO + 0x130 + 27 * 4, 18 | (1 << 7));
+    qtest_writel(q, GPIO + 0x130 + 28 * 4, 19 | (1 << 7));
+    qtest_writel(q, GPIO + 0x130 + 155 * 4, 23 | (1 << 7));
+    qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 18, 0);
+    qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 19, 0);
+    qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 23, 0);
+    qtest_set_irq_in(q, "/machine/soc/gpio", "pad-drive", 25, 1);
+    qtest_writel(q, I2S + 8, (1 << 5) | (1 << 7));
+    receive_constant_frame(q, 0);
+    /* Matrix and input-enable edits must publish a new sample even when
+     * neither physical data pad has an edge. */
+    qtest_writel(q, GPIO + 0x130 + 155 * 4, 25 | (1 << 7));
+    receive_constant_frame(q, UINT32_MAX);
+    qtest_writel(q, MUX + 0x24, 2 << 12);
+    receive_constant_frame(q, 0);
+    qtest_writel(q, GPIO + 0x130 + 155 * 4, 0x38 | (1 << 7));
+    receive_constant_frame(q, UINT32_MAX);
+    qtest_writel(q, GPIO + 0x130 + 155 * 4, 0x38 | (1 << 7) | (1 << 6));
+    receive_constant_frame(q, 0);
+    qtest_quit(q);
+}
 
 static void pad_resolution(void)
 {
@@ -90,5 +186,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     g_test_add_func("/esp32/pad-resolution-and-vcd", pad_resolution);
     g_test_add_func("/esp32/trace-host-write-failure", trace_failure);
+    g_test_add_func("/esp32/live-output-routing", live_output_routing);
+    g_test_add_func("/esp32/live-input-routing", live_input_routing);
     return g_test_run();
 }

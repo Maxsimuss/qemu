@@ -381,6 +381,44 @@ static void master_10bit_peer(void)
     }
 }
 
+/* TRM21.3.4/21.3.5 starts execution from the stored command registers.
+ * Their meaning must not depend on the host's history of MMIO writes. */
+static void stored_command_reuse(void)
+{
+    for (unsigned port = 0; port < 2; port++) {
+        Bus b = bus_fixture(port, true,
+            "-device esp32-i2c-peer,gpio=/machine/soc/gpio");
+        reg(&b, 0x58, 0);
+        reg(&b, 0x5c, (1 << 11) | (1 << 8) | 3);
+        reg(&b, 0x60, 3 << 11);
+        for (unsigned transfer = 0; transfer < 2; transfer++) {
+            reg(&b, 0x24, 0x1fff);
+            reg(&b, 0x1c, 0xa0);
+            reg(&b, 0x1c, 0x20);
+            reg(&b, 0x1c, 0x96 + transfer);
+            reg(&b, 4, 0x33);
+            wait_complete(&b);
+            g_assert_true(pin(&b, SDA));
+            g_assert_true(pin(&b, SCL));
+            g_assert_true(rd(&b, 0x60) & 0x80000000);
+        }
+        reg(&b, 0x24, 0x1fff);
+        reg(&b, 0x1c, 0xa0);
+        reg(&b, 0x1c, 0x20);
+        reg(&b, 0x1c, 0xa1);
+        reg(&b, 0x58, 0);
+        reg(&b, 0x5c, (1 << 11) | (1 << 8) | 2);
+        reg(&b, 0x60, 0);
+        reg(&b, 0x64, (1 << 11) | (1 << 8) | 1);
+        reg(&b, 0x68, (2 << 11) | (1 << 10) | 1);
+        reg(&b, 0x6c, 3 << 11);
+        reg(&b, 4, 0x33);
+        wait_complete(&b);
+        g_assert_cmphex(rd(&b, 0x1c), ==, 0x97);
+        qtest_quit(b.q);
+    }
+}
+
 static void end_resume_gate_reset(void)
 {
     Bus b = bus_fixture(0, true,
@@ -803,6 +841,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/i2c/stretch-timeout-arbitration", stretch_timeout_arbitration);
     qtest_add_func("/esp32/i2c/peer-repeated-start", peer_repeated_start);
     qtest_add_func("/esp32/i2c/end-resume-gate-reset", end_resume_gate_reset);
+    qtest_add_func("/esp32/i2c/stored-command-reuse", stored_command_reuse);
     qtest_add_func("/esp32/i2c/fifo-overflow-interrupt-mask", fifo_overflow_and_interrupt_mask);
     qtest_add_func("/esp32/i2c/pin-trace-timing", pin_trace_timing);
     qtest_add_func("/esp32/i2c/simultaneous-controllers", simultaneous_controllers);

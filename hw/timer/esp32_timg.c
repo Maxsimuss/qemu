@@ -408,14 +408,28 @@ static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s, uint64_t ns_n
         return s->count_base;
     }
     uint64_t ns_from_base = ns_now - s->ns_base;
-    uint64_t ticks_from_base = muldiv64(ns_from_base, s->parent->apb_freq_hz / 1000000, 1000 * s->divider);
+    uint64_t ticks_from_base = muldiv64(ns_from_base, s->parent->apb_freq_hz,
+                                      NANOSECONDS_PER_SECOND) / s->divider;
     uint64_t count = esp32_timg_timer_direction(s) * ticks_from_base + s->count_base;
     return count;
 }
 
+static uint64_t esp32_timg_ticks_to_ns(uint64_t count, uint32_t divider,
+                                      uint32_t apb_hz)
+{
+    uint64_t low, high;
+
+    /* muldiv64's multiplier is only 32 bits. Keep the full product for large
+     * prescalers instead of overflowing or truncating APB to whole MHz. */
+    mulu64(&low, &high, count,
+           (uint64_t)NANOSECONDS_PER_SECOND * divider);
+    divu128(&low, &high, apb_hz);
+    return high ? INT64_MAX : MIN(low, INT64_MAX);
+}
+
 static uint64_t esp32_timg_timer_count_to_ns(Esp32TimgTimerState *s, uint64_t count)
 {
-    return muldiv64(count, 1000 * s->divider, s->parent->apb_freq_hz / 1000000);
+    return esp32_timg_ticks_to_ns(count, s->divider, s->parent->apb_freq_hz);
 }
 
 static uint32_t esp32_timg_timer_div_from_reg(uint32_t reg_val)
@@ -483,7 +497,8 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
     TIMG_DEBUG_LOG("%s: TG%d count_to_alarm=0x%llx ns_to_alarm=0x%llx\n", __func__, ts->parent->id,
                  count_to_alarm, ns_to_alarm);
 
-    timer_mod_anticipate_ns(&ts->alarm_timer, ns_now + ns_to_alarm);
+    timer_mod_anticipate_ns(&ts->alarm_timer,
+        ns_to_alarm > INT64_MAX - ns_now ? INT64_MAX : ns_now + ns_to_alarm);
 }
 
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
@@ -497,7 +512,9 @@ static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws, uint64_t ns_now)
         return ws->count_base;
     }
     uint64_t ns_from_base = ns_now - ws->ns_base;
-    uint64_t ticks_from_base = muldiv64(ns_from_base, ws->parent->apb_freq_hz / 1000000, 1000 * MAX(ws->prescale, 1));
+    uint64_t ticks_from_base = muldiv64(ns_from_base, ws->parent->apb_freq_hz,
+                                      NANOSECONDS_PER_SECOND) /
+                              MAX(ws->prescale, 1);
     uint64_t count = ticks_from_base + ws->count_base;
     return count;
 }
@@ -555,10 +572,12 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
     uint32_t stage_timeout = ws->timeout[ws->cur_stage];
     uint32_t cur_count = esp32_timg_wdt_get_count(ws, ns_now);
     uint32_t count_to_timeout = stage_timeout - cur_count;
-    uint64_t ns_to_timeout = muldiv64(count_to_timeout, 1000 * ws->prescale, ws->parent->apb_freq_hz / 1000000);
+    uint64_t ns_to_timeout = esp32_timg_ticks_to_ns(count_to_timeout,
+        ws->prescale, ws->parent->apb_freq_hz);
     TIMG_DEBUG_LOG("%s: TG%d ns=0x%08llx stage %d count=0x%08x count_to_timeout=0x%08x ns_to_timeout=0x%08llx\n",
                    __func__, ws->parent->id, ns_now, ws->cur_stage, cur_count, count_to_timeout, ns_to_timeout);
-    timer_mod_anticipate_ns(&ws->stage_timer, ns_now + ns_to_timeout);
+    timer_mod_anticipate_ns(&ws->stage_timer,
+        ns_to_timeout > INT64_MAX - ns_now ? INT64_MAX : ns_now + ns_to_timeout);
 }
 
 static void esp32_timg_wdt_cb(void *opaque)

@@ -55,8 +55,14 @@ typedef struct Esp32GpioState {
     uint8_t external_resolved[ESP32_GPIO_PADS];
     uint8_t signal_sample[ESP32_GPIO_SIGNALS];
     uint8_t input_sample[ESP32_GPIO_PADS];
+    /* Derived routing dependencies; rebuilt after MMIO edits/reset/load.
+     * They are host dispatch caches, not migrated hardware state. */
+    uint64_t output_pads[ESP32_GPIO_OUTPUTS];
+    uint64_t input_signals[ESP32_GPIO_PADS][ESP32_GPIO_SIGNALS / 64];
+    uint64_t pending_pads;
+    bool routes_valid;
+    bool pending_all_inputs;
     bool resolving;
-    bool dirty;
     bool resetting;
     char *pin_trace;
     FILE *trace;

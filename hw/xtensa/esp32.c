@@ -231,6 +231,13 @@ static void esp32_clk_update(void* opaque, int n, int level)
         return;
     }
 
+    /* Audio clock availability is independent of the CPU clock mux. In
+     * particular, an invalid CPU source must not retain a stale I2S APLL. */
+    uint32_t apll_hz = esp32_rtc_get_apll_hz(&s->rtc_cntl);
+    for (unsigned i = 0; i < 2; i++) {
+        esp32_i2s_set_apll(&s->i2s[i], apll_hz);
+    }
+
     /* APB clock */
     uint32_t apb_clk_freq, cpu_clk_freq;
     if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
@@ -244,8 +251,26 @@ static void esp32_clk_update(void* opaque, int n, int level)
     } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_8M) {
         apb_clk_freq = cpu_clk_freq = 8000000;
     } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_APLL) {
-        qemu_log_mask(LOG_UNIMP, "esp32: APLL CPU/APB clock source is not modeled\n");
-        return;
+        uint32_t apll = esp32_rtc_get_apll_hz(&s->rtc_cntl);
+        if (!apll) {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32: APLL CPU/APB selected but unavailable "
+                          "(disabled or invalid coefficients)\n");
+            return;
+        }
+        unsigned div;
+        if (s->dport.cpuperiod_sel == 0) {
+            div = 4;
+        } else if (s->dport.cpuperiod_sel == 1) {
+            div = 2;
+        } else {
+            qemu_log_mask(LOG_GUEST_ERROR,
+                          "esp32: reserved CPU APLL divider %u\n",
+                          s->dport.cpuperiod_sel);
+            return;
+        }
+        cpu_clk_freq = apll / div;
+        apb_clk_freq = cpu_clk_freq / 2;
     } else {
         apb_clk_freq = s->rtc_cntl.xtal_apb_freq;
         cpu_clk_freq = apb_clk_freq;
@@ -378,7 +403,7 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_RESET_GPIO, 1));
     qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_APPCPU_STALL_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CPU_STALL_GPIO, 1));
-    qdev_connect_gpio_out_named(DEVICE(&s->rtc_cntl), ESP32_DPORT_CLK_UPDATE_GPIO, 0,
+    qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_CLK_UPDATE_GPIO, 0,
                                 qdev_get_gpio_in_named(dev, ESP32_RTC_CLK_UPDATE_GPIO, 0));
 
     for (int i = 0; i < ESP32_CPU_COUNT; ++i) {
@@ -543,6 +568,8 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2s[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_I2S0_INTR_SOURCE + i));
         esp32_i2s_connect_gpio(&s->i2s[i], &s->gpio, i);
+        esp32_i2s_set_apll(&s->i2s[i],
+                           esp32_rtc_get_apll_hz(&s->rtc_cntl));
     }
     const unsigned clock_bits[] = {4, 7, 18, 21};
     for (unsigned i = 0; i < ARRAY_SIZE(clock_bits); i++) {

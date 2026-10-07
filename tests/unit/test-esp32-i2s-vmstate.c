@@ -20,6 +20,11 @@ int64_t cpus_get_virtual_clock(void) { return virtual_time; }
 void cpus_set_virtual_clock(int64_t time) { virtual_time = time; }
 int64_t icount_get_raw(void) { return virtual_time; }
 void icount_start_warp_timer(void) { g_assert_not_reached(); }
+unsigned icount_process_idle_timers(bool (*pending_work)(void))
+{
+    g_assert_not_reached();
+}
+
 bool icount_configure(QemuOpts *opts, Error **errp) { g_assert_not_reached(); }
 void icount_account_warp_timer(void) { g_assert_not_reached(); }
 void icount_notify_exit(void) { g_assert_not_reached(); }

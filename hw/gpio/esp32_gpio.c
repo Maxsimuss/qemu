@@ -12,6 +12,7 @@
 #include "qemu/error-report.h"
 #include "qemu/module.h"
 #include "qemu/timer.h"
+#include "qemu/host-utils.h"
 #include "qapi/error.h"
 #include "migration/vmstate.h"
 #include "hw/irq.h"
@@ -279,18 +280,55 @@ static unsigned matrix_input(Esp32GpioState *s, unsigned signal)
     return sample ^ !!(cfg & BIT(6));
 }
 
-static void gpio_resolve(Esp32GpioState *s)
+static void cache_routes(Esp32GpioState *s)
+{
+    if (s->routes_valid) {
+        return;
+    }
+    memset(s->output_pads, 0, sizeof(s->output_pads));
+    memset(s->input_signals, 0, sizeof(s->input_signals));
+    for (unsigned pad = 0; pad < ESP32_GPIO_PADS; pad++) {
+        int signal = selected_output(s, pad);
+        if (valid_pad(pad) && signal >= 0 && signal < ESP32_GPIO_OUTPUTS) {
+            s->output_pads[signal] |= UINT64_C(1) << pad;
+        }
+    }
+    for (unsigned signal = 0; signal < ESP32_GPIO_SIGNALS; signal++) {
+        uint32_t cfg = R(s, GPIO_INPUT_SEL + signal * 4);
+        unsigned pad = cfg & 63;
+        if (!(cfg & BIT(7))) {
+            if (signal != 14) {
+                continue;
+            }
+            pad = 3; /* native UART0 RX */
+        }
+        if (valid_pad(pad)) {
+            s->input_signals[pad][signal / 64] |= UINT64_C(1) << (signal % 64);
+        }
+    }
+    s->routes_valid = true;
+}
+
+static void gpio_resolve_pads(Esp32GpioState *s, uint64_t pads, bool all_inputs)
 {
     unsigned passes = 0;
 
-    s->dirty = true;
-    if (s->resolving) {
+    s->pending_pads |= pads;
+    s->pending_all_inputs |= all_inputs;
+    if (s->resolving || (!s->pending_pads && !s->pending_all_inputs)) {
         return;
     }
     s->resolving = true;
     do {
-        s->dirty = false;
-        for (unsigned pad = 0; pad < ESP32_GPIO_PADS; pad++) {
+        uint64_t inputs[ESP32_GPIO_SIGNALS / 64] = {0};
+        uint64_t pending = s->pending_pads;
+        bool refresh_inputs = s->pending_all_inputs;
+        s->pending_pads = 0;
+        s->pending_all_inputs = false;
+        cache_routes(s);
+        while (pending) {
+            unsigned pad = ctz64(pending);
+            pending &= pending - 1;
             uint32_t mux = mux_value(s, pad);
             uint32_t cfg = R(s, GPIO_OUTPUT_SEL + pad * 4);
             unsigned function = mux_function(s, pad);
@@ -358,6 +396,11 @@ static void gpio_resolve(Esp32GpioState *s)
             sampled = sample_input(s, pad);
             old_sample = s->input_sample[pad];
             s->input_sample[pad] = sampled;
+            if (sampled != old_sample) {
+                for (unsigned word = 0; word < ARRAY_SIZE(inputs); word++) {
+                    inputs[word] |= s->input_signals[pad][word];
+                }
+            }
             if (!s->resetting) {
                 unsigned type = (R(s, GPIO_PIN + pad * 4) >> 7) & 7;
                 if ((type == 1 && !old_sample && sampled) ||
@@ -368,22 +411,35 @@ static void gpio_resolve(Esp32GpioState *s)
                 }
             }
         }
-        for (unsigned signal = 0; signal < ESP32_GPIO_SIGNALS; signal++) {
-            unsigned sample = matrix_input(s, signal);
-            if (s->signal_sample[signal] != sample) {
-                s->signal_sample[signal] = sample;
-                qemu_set_irq(s->signal_in[signal], sample);
+        for (unsigned word = 0; word < ARRAY_SIZE(inputs); word++) {
+            uint64_t signals = refresh_inputs ? UINT64_MAX : inputs[word];
+            while (signals) {
+                unsigned signal = word * 64 + ctz64(signals);
+                unsigned sample = matrix_input(s, signal);
+                signals &= signals - 1;
+                if (s->signal_sample[signal] != sample) {
+                    s->signal_sample[signal] = sample;
+                    qemu_set_irq(s->signal_in[signal], sample);
+                }
             }
         }
-        if (++passes == 256 && s->dirty) {
+        if (++passes == 256 && (s->pending_pads || s->pending_all_inputs)) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32.gpio: combinational pad oscillation\n");
             break;
         }
-    } while (s->dirty);
+    } while (s->pending_pads || s->pending_all_inputs);
     s->resolving = false;
     update_irq(s);
     trace_flush(s);
+}
+
+/* Register changes can alter any route, pull, input enable or interrupt.
+ * A full refresh also publishes constants/inverted inputs without pad edges. */
+static void gpio_resolve(Esp32GpioState *s)
+{
+    s->routes_valid = false;
+    gpio_resolve_pads(s, (UINT64_C(1) << ESP32_GPIO_PADS) - 1, true);
 }
 
 void esp32_gpio_set_peripheral_output(Esp32GpioState *s, unsigned signal,
@@ -401,7 +457,8 @@ void esp32_gpio_set_peripheral_output(Esp32GpioState *s, unsigned signal,
     s->peripheral_value[signal] = level;
     s->peripheral_enable[signal] = enable;
     s->peripheral_open_drain[signal] = open_drain;
-    gpio_resolve(s);
+    cache_routes(s);
+    gpio_resolve_pads(s, s->output_pads[signal], false);
 }
 
 void esp32_gpio_set_peripheral_input(Esp32GpioState *s, unsigned signal,
@@ -418,8 +475,11 @@ void esp32_gpio_set_peripheral_unknown(Esp32GpioState *s, unsigned signal)
     if (!s || signal >= ESP32_GPIO_OUTPUTS) {
         return;
     }
-    s->peripheral_known[signal] = 0;
-    gpio_resolve(s);
+    if (s->peripheral_known[signal]) {
+        s->peripheral_known[signal] = 0;
+        cache_routes(s);
+        gpio_resolve_pads(s, s->output_pads[signal], false);
+    }
 }
 
 void esp32_gpio_set_external_drive(Esp32GpioState *s, unsigned pad,
@@ -427,8 +487,11 @@ void esp32_gpio_set_external_drive(Esp32GpioState *s, unsigned pad,
 {
     assert(pad < ESP32_GPIO_PADS && driver < ESP32_GPIO_EXT_DRIVERS);
     assert(level <= ESP32_PAD_X);
-    s->external[driver * ESP32_GPIO_PADS + pad] = level;
-    gpio_resolve(s);
+    unsigned index = driver * ESP32_GPIO_PADS + pad;
+    if (s->external[index] != level) {
+        s->external[index] = level;
+        gpio_resolve_pads(s, UINT64_C(1) << pad, false);
+    }
 }
 
 Esp32PadLevel esp32_gpio_get_pad(Esp32GpioState *s, unsigned pad)
@@ -475,16 +538,11 @@ bool esp32_gpio_output_is_routed(Esp32GpioState *s, unsigned signal)
     if (!s) {
         return false;
     }
-    for (unsigned pad = 0; pad < ESP32_GPIO_PADS; pad++) {
-        if (!valid_pad(pad)) {
-            continue;
-        }
-        int output = selected_output(s, pad);
-        if (output == signal) {
-            return true;
-        }
+    if (signal >= ESP32_GPIO_OUTPUTS) {
+        return false;
     }
-    return false;
+    cache_routes(s);
+    return s->output_pads[signal] != 0;
 }
 
 static void routing_changed(Esp32GpioState *s)
@@ -671,6 +729,8 @@ static int gpio_post_load(void *opaque, int version)
         }
     }
     s->resolving = false;
+    s->pending_pads = 0;
+    s->pending_all_inputs = false;
     gpio_resolve(s);
     return 0;
 }

@@ -140,6 +140,7 @@ system_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files(
   'esp32_crosscore_int.c',
   'esp32_dport.c',
   'esp32_i2s.c',
+  'esp32_i2s_dac.c',
   'esp32_i2s_vmstate.c',
   'esp32_rng.c',
   'esp32_rtc_cntl.c',

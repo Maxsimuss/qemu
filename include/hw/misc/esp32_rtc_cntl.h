@@ -73,6 +73,18 @@ typedef struct Esp32RtcCntlState {
     uint32_t scratch_reg[ESP32_RTC_CNTL_SCRATCH_REG_COUNT];
     Esp32ResetCause reset_cause[ESP32_CPU_COUNT];
     bool stat_vector_sel[ESP32_CPU_COUNT];
+    /* TRM v5.8 Register 9.11 RTC_CNTL_ANA_CONF_REG (0x0030). Only the
+     * documented power bits are modeled; bits 29, 25 and 22..0 read 0. */
+    uint32_t ana_conf_reg;
+    /* APLL formula parameters from TRM v5.8 section 7.2.7. The TRM does not
+     * define the internal analog programming bus, so coefficients are fixture
+     * properties rather than guest-programmable registers. */
+    uint32_t apll_sdm0;
+    uint32_t apll_sdm1;
+    uint32_t apll_sdm2;
+    uint32_t apll_odiv;
+    uint32_t apll_xtal_hz;
+    bool apll_rev0;
 } Esp32RtcCntlState;
 
 REG32(RTC_CNTL_OPTIONS0, 0x00)
@@ -87,6 +99,15 @@ REG32(RTC_CNTL_TIME_UPDATE, 0xc)
     FIELD(RTC_CNTL_TIME_UPDATE, VALID, 30, 1)
 REG32(RTC_CNTL_TIME0, 0x10)
 REG32(RTC_CNTL_TIME1, 0x14)
+
+REG32(RTC_CNTL_ANA_CONF, 0x30)
+    FIELD(RTC_CNTL_ANA_CONF, PLL_I2C_PU, 31, 1)
+    FIELD(RTC_CNTL_ANA_CONF, CKGEN_I2C_PU, 30, 1)
+    FIELD(RTC_CNTL_ANA_CONF, RFRX_PBUS_PU, 28, 1)
+    FIELD(RTC_CNTL_ANA_CONF, TXRF_I2C_PU, 27, 1)
+    FIELD(RTC_CNTL_ANA_CONF, PVTMON_PU, 26, 1)
+    FIELD(RTC_CNTL_ANA_CONF, PLLA_FORCE_PU, 24, 1)
+    FIELD(RTC_CNTL_ANA_CONF, PLLA_FORCE_PD, 23, 1)
 
 REG32(RTC_CNTL_RESET_STATE, 0x34)
     FIELD(RTC_CNTL_RESET_STATE, PROCPU_STAT_VECTOR_SEL, 13, 1)
@@ -115,3 +136,11 @@ REG32(RTC_CNTL_STORE7, 0xbc)
 REG32(RTC_CNTL_DATE,   0x13c)
 
 #define ESP32_RTC_CNTL_SIZE (A_RTC_CNTL_DATE + 4)
+
+/* TRM v5.8 section 7.2.7 Audio PLL formula. Returns 0 when the documented
+ * parameter ranges are violated. Integer truncation matches the IDF
+ * coefficient search, which truncates the real-valued result to 32 bits. */
+uint32_t esp32_apll_compute_hz(uint32_t xtal_hz, unsigned sdm0, unsigned sdm1,
+                               unsigned sdm2, unsigned odiv, bool rev0);
+bool esp32_rtc_apll_enabled(const Esp32RtcCntlState *s);
+uint32_t esp32_rtc_get_apll_hz(Esp32RtcCntlState *s);
