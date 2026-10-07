@@ -3,6 +3,8 @@
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/registerfields.h"
+#include "qemu/timer.h"
+#include "qemu/timer.h"
 
 #define TYPE_ESP32_RTC_CNTL "misc.esp32.rtc_cntl"
 #define ESP32_RTC_CNTL(obj) OBJECT_CHECK(Esp32RtcCntlState, (obj), TYPE_ESP32_RTC_CNTL)
@@ -51,6 +53,9 @@ typedef struct Esp32RtcCntlState {
     SysBusDevice parent_obj;
 
     MemoryRegion iomem;
+    MemoryRegion ana_i2c_iomem;
+    QEMUTimer *ana_i2c_timer;
+    QEMUTimer *apll_cal_timer;
     qemu_irq irq;
     qemu_irq dig_reset_req;
     qemu_irq cpu_reset_req[ESP32_CPU_COUNT];
@@ -76,15 +81,16 @@ typedef struct Esp32RtcCntlState {
     /* TRM v5.8 Register 9.11 RTC_CNTL_ANA_CONF_REG (0x0030). Only the
      * documented power bits are modeled; bits 29, 25 and 22..0 read 0. */
     uint32_t ana_conf_reg;
-    /* APLL formula parameters from TRM v5.8 section 7.2.7. The TRM does not
-     * define the internal analog programming bus, so coefficients are fixture
-     * properties rather than guest-programmable registers. */
-    uint32_t apll_sdm0;
-    uint32_t apll_sdm1;
-    uint32_t apll_sdm2;
-    uint32_t apll_odiv;
-    uint32_t apll_xtal_hz;
-    bool apll_rev0;
+    uint32_t ana_config_reg;
+    uint32_t ana_i2c_cmd[8];
+    uint32_t apll_analog[10];
+    uint32_t ana_i2c_last_cmd;
+    uint8_t ana_i2c_pending_host;
+    bool ana_i2c_pending;
+    bool apll_calibrating;
+    bool apll_cal_valid;
+    bool apll_model_warned;
+    int64_t apll_cal_deadline_ns;
 } Esp32RtcCntlState;
 
 REG32(RTC_CNTL_OPTIONS0, 0x00)
@@ -144,3 +150,5 @@ uint32_t esp32_apll_compute_hz(uint32_t xtal_hz, unsigned sdm0, unsigned sdm1,
                                unsigned sdm2, unsigned odiv, bool rev0);
 bool esp32_rtc_apll_enabled(const Esp32RtcCntlState *s);
 uint32_t esp32_rtc_get_apll_hz(Esp32RtcCntlState *s);
+bool esp32_rtc_get_apll_rate(Esp32RtcCntlState *s, uint64_t *numerator,
+                             uint64_t *denominator);

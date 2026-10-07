@@ -275,6 +275,12 @@ static void esp32_efuse_init(Object *obj)
 
     memset(&s->efuse_rd, 0, sizeof(s->efuse_rd));
     memset(&s->efuse_wr, 0, sizeof(s->efuse_wr));
+    /* This machine exposes an ECO3 SYSCON_DATE value in esp32.c and boots
+     * the revision-300 mask ROM. Match its factory revision fields when no
+     * persistent eFuse image is supplied; an explicit image replaces these
+     * defaults in esp32_efuse_read_op(). */
+    s->efuse_rd.blk0[3] |= BIT(15); /* CHIP_VER_REV1 */
+    s->efuse_rd.blk0[5] |= BIT(20); /* CHIP_VER_REV2 */
 }
 
 static Property esp32_efuse_properties[] = {

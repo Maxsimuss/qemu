@@ -61,6 +61,8 @@ struct Esp32I2SState {
     bool enabled;
     bool pumping_dma;
     uint32_t apll_hz;
+    uint64_t apll_numerator;
+    uint64_t apll_denominator;
     uint32_t warned_capabilities;
 };
 extern const VMStateDescription vmstate_esp32_i2s;
@@ -72,4 +74,6 @@ void esp32_i2s_connect_gpio(Esp32I2SState *s, Esp32GpioState *gpio,
                           unsigned controller);
 void esp32_i2s_set_enabled(Esp32I2SState *s, bool enabled);
 void esp32_i2s_set_apll(Esp32I2SState *s, uint32_t hz);
+void esp32_i2s_set_apll_rate(Esp32I2SState *s, uint64_t numerator,
+                             uint64_t denominator);
 #endif

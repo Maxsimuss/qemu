@@ -528,21 +528,24 @@ static bool clock_step(Esp32I2SState *s, unsigned divider,
     uint64_t n = cfg & 255;
     uint64_t a = (cfg >> 14) & 63;
     uint64_t b = (cfg >> 8) & 63;
-    uint64_t hz = (cfg & BIT(21)) ? s->apll_hz : 160000000;
-    uint64_t denominator, numerator;
+    uint64_t source_num = (cfg & BIT(21)) ? s->apll_numerator : 160000000;
+    uint64_t source_den = (cfg & BIT(21)) ? s->apll_denominator : 1;
+    uint64_t denominator;
+    __uint128_t numerator, accumulated;
 
-    if (!s->enabled || !(cfg & BIT(20)) || !hz || n < 2 ||
+    if (!s->enabled || !(cfg & BIT(20)) || !source_num || !source_den || n < 2 ||
         (!a && b) || divider == 0) {
         return false;
     }
     if (!a) {
         a = 1;
     }
-    denominator = 2 * a * hz;
-    numerator = (n * a + b) * divider * UINT64_C(1000000000);
-    *remainder += numerator;
-    *deadline += *remainder / denominator;
-    *remainder %= denominator;
+    denominator = 2 * a * source_num;
+    numerator = (__uint128_t)(n * a + b) * divider *
+                UINT64_C(1000000000) * source_den;
+    accumulated = numerator + *remainder;
+    *deadline += accumulated / denominator;
+    *remainder = accumulated % denominator;
     return true;
 }
 
@@ -981,7 +984,15 @@ void esp32_i2s_set_enabled(Esp32I2SState *s, bool enabled)
 
 void esp32_i2s_set_apll(Esp32I2SState *s, uint32_t hz)
 {
-    s->apll_hz = hz;
+    esp32_i2s_set_apll_rate(s, hz, 1);
+}
+
+void esp32_i2s_set_apll_rate(Esp32I2SState *s, uint64_t numerator,
+                             uint64_t denominator)
+{
+    s->apll_numerator = numerator;
+    s->apll_denominator = denominator ? denominator : 1;
+    s->apll_hz = numerator / s->apll_denominator;
     i2s_update(s);
 }
 
@@ -1189,6 +1200,7 @@ static void i2s_init(Object *obj)
     s->tx.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, tx_clock, s);
     s->rx.timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, rx_clock, s);
     s->mclk_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, mclk_clock, s);
+    s->apll_denominator = 1;
     s->inputs = qemu_allocate_irqs(input_changed, s, 25);
     s->enabled = true;
 }
