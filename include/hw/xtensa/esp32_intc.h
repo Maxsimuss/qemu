@@ -34,8 +34,9 @@ typedef struct Esp32IntMatrixState {
     MemoryRegion iomem;
     qemu_irq *outputs[ESP32_CPU_COUNT];
     uint8_t irq_map[ESP32_CPU_COUNT][ESP32_INT_MATRIX_INPUTS];
+    uint8_t source_level[ESP32_CPU_COUNT][ESP32_INT_MATRIX_INPUTS];
+    qemu_irq route_output[ESP32_CPU_COUNT * 32];
 
     /* properties */
     XtensaCPU *cpu[ESP32_CPU_COUNT];
 } Esp32IntMatrixState;
-

@@ -184,6 +184,9 @@ static void esp32_soc_reset(DeviceState *dev)
         for (int i = 0; i < ESP32_I2C_COUNT; i++) {
             device_cold_reset(DEVICE(&s->i2c[i]));
         }
+        for (int i = 0; i < 2; i++) {
+            device_cold_reset(DEVICE(&s->i2s[i]));
+        }
         device_cold_reset(DEVICE(&s->twai));
         device_cold_reset(DEVICE(&s->efuse));
         if (s->eth) {
@@ -232,8 +235,17 @@ static void esp32_clk_update(void* opaque, int n, int level)
     uint32_t apb_clk_freq, cpu_clk_freq;
     if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
         const uint32_t cpu_clk_mul[] = {1, 2, 3};
+        if (s->dport.cpuperiod_sel >= ARRAY_SIZE(cpu_clk_mul)) {
+            qemu_log_mask(LOG_GUEST_ERROR, "esp32: reserved CPU PLL divider\n");
+            return;
+        }
         apb_clk_freq = s->rtc_cntl.pll_apb_freq;
         cpu_clk_freq = cpu_clk_mul[s->dport.cpuperiod_sel] * apb_clk_freq;
+    } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_8M) {
+        apb_clk_freq = cpu_clk_freq = 8000000;
+    } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_APLL) {
+        qemu_log_mask(LOG_UNIMP, "esp32: APLL CPU/APB clock source is not modeled\n");
+        return;
     } else {
         apb_clk_freq = s->rtc_cntl.xtal_apb_freq;
         cpu_clk_freq = apb_clk_freq;
@@ -241,8 +253,36 @@ static void esp32_clk_update(void* opaque, int n, int level)
     qdev_prop_set_int32(DEVICE(&s->frc_timer), "apb_freq", apb_clk_freq);
     qdev_prop_set_int32(DEVICE(&s->timg[0]), "apb_freq", apb_clk_freq);
     qdev_prop_set_int32(DEVICE(&s->timg[1]), "apb_freq", apb_clk_freq);
+    for (unsigned i = 0; i < ESP32_I2C_COUNT; i++) {
+        esp32_i2c_set_apb_freq(&s->i2c[i], apb_clk_freq);
+    }
     clock_update_hz(s->cpu[0].clock, cpu_clk_freq );
     clock_update_hz(s->cpu[1].clock, cpu_clk_freq );
+}
+
+static void esp32_perip_update(void *opaque, int bit, int level)
+{
+    Esp32SocState *s = opaque;
+    unsigned i;
+    bool i2s;
+    bool reset = !!(s->dport.perip_rst_en & BIT(bit));
+    bool enabled = !reset && !!(s->dport.perip_clk_en & BIT(bit));
+
+    switch (bit) {
+    case 7: i = 0; i2s = false; break;
+    case 18: i = 1; i2s = false; break;
+    case 4: i = 0; i2s = true; break;
+    case 21: i = 1; i2s = true; break;
+    default: return;
+    }
+    if (reset) {
+        device_cold_reset(i2s ? DEVICE(&s->i2s[i]) : DEVICE(&s->i2c[i]));
+    }
+    if (i2s) {
+        esp32_i2s_set_enabled(&s->i2s[i], enabled);
+    } else {
+        esp32_i2c_set_enabled(&s->i2c[i], enabled);
+    }
 }
 
 static void esp32_soc_add_periph_device(MemoryRegion *dest, void* dev, hwaddr dport_base_addr)
@@ -414,6 +454,23 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     qdev_realize(DEVICE(&s->gpio), &s->periph_bus, &error_fatal);
     esp32_soc_add_periph_device(sys_mem, &s->gpio, DR_REG_GPIO_BASE);
+    memory_region_add_subregion(sys_mem, DR_REG_IO_MUX_BASE, &s->gpio.io_mux);
+    MemoryRegion *iomux_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(iomux_apb, OBJECT(&s->gpio), "esp32.iomux-apb",
+                            &s->gpio.io_mux, 0, memory_region_size(&s->gpio.io_mux));
+    memory_region_add_subregion(sys_mem,
+                               DR_REG_IO_MUX_BASE - DR_REG_DPORT_APB_BASE + APB_REG_BASE,
+                               iomux_apb);
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 0,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source", ETS_GPIO_INTR_SOURCE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 1,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source", ETS_GPIO_NMI_SOURCE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 2,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source",
+                                             ESP32_INT_MATRIX_INPUTS + ETS_GPIO_INTR_SOURCE));
+    sysbus_connect_irq(SYS_BUS_DEVICE(&s->gpio), 3,
+                       qdev_get_gpio_in_named(intmatrix_dev, "cpu-source",
+                                             ESP32_INT_MATRIX_INPUTS + ETS_GPIO_NMI_SOURCE));
 
     for (int i = 0; i < ESP32_UART_COUNT; ++i) {
         const hwaddr uart_base[] = {DR_REG_UART_BASE, DR_REG_UART1_BASE, DR_REG_UART2_BASE};
@@ -476,6 +533,23 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
         sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2c[i]), 0,
                            qdev_get_gpio_in(intmatrix_dev, ETS_I2C_EXT0_INTR_SOURCE + i));
+        esp32_i2c_connect_gpio(&s->i2c[i], &s->gpio, i);
+        esp32_i2c_set_apb_freq(&s->i2c[i], s->rtc_cntl.xtal_apb_freq);
+    }
+    for (unsigned i = 0; i < 2; i++) {
+        qdev_realize(DEVICE(&s->i2s[i]), &s->periph_bus, &error_fatal);
+        esp32_soc_add_periph_device(sys_mem, &s->i2s[i],
+                                   i ? DR_REG_I2S1_BASE : DR_REG_I2S_BASE);
+        sysbus_connect_irq(SYS_BUS_DEVICE(&s->i2s[i]), 0,
+                           qdev_get_gpio_in(intmatrix_dev, ETS_I2S0_INTR_SOURCE + i));
+        esp32_i2s_connect_gpio(&s->i2s[i], &s->gpio, i);
+    }
+    const unsigned clock_bits[] = {4, 7, 18, 21};
+    for (unsigned i = 0; i < ARRAY_SIZE(clock_bits); i++) {
+        unsigned bit = clock_bits[i];
+        qemu_irq target = qdev_get_gpio_in_named(dev, "periph-update", bit);
+        qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_PERIP_CLOCK_GPIO, bit, target);
+        qdev_connect_gpio_out_named(DEVICE(&s->dport), ESP32_DPORT_PERIP_RESET_GPIO, bit, target);
     }
 
     /* TWAI model passes intmatrix IRQs to the SJA1000 controller model
@@ -519,13 +593,10 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
     esp32_soc_add_unimp_device(sys_mem, "esp32.analog", DR_REG_ANA_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_RTCIO_BASE, 0x400);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rtcio", DR_REG_SENS_BASE, 0x400);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.iomux", DR_REG_IO_MUX_BASE, 0x2000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.hinf", DR_REG_HINF_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slc", DR_REG_SLC_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.slchost", DR_REG_SLCHOST_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.apbctrl", DR_REG_APB_CTRL_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s0", DR_REG_I2S_BASE, 0x1000);
-    esp32_soc_add_unimp_device(sys_mem, "esp32.i2s1", DR_REG_I2S1_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.rmt", DR_REG_RMT_BASE, 0x1000);
     esp32_soc_add_unimp_device(sys_mem, "esp32.pcnt", DR_REG_PCNT_BASE, 0x1000);
 
@@ -625,6 +696,10 @@ static void esp32_soc_init(Object *obj)
         snprintf(name, sizeof(name), "i2c%d", i);
         object_initialize_child(obj, name, &s->i2c[i], TYPE_ESP32_I2C);
     }
+    for (unsigned i = 0; i < 2; i++) {
+        snprintf(name, sizeof(name), "i2s%u", i);
+        object_initialize_child(obj, name, &s->i2s[i], TYPE_ESP32_I2S);
+    }
 
     object_initialize_child(obj, "twai", &s->twai, TYPE_ESP32_TWAI);
 
@@ -647,6 +722,7 @@ static void esp32_soc_init(Object *obj)
     object_initialize_child(obj, "rgb", &s->rgb, TYPE_ESP_RGB);
 
     qdev_init_gpio_in_named(DEVICE(s), esp32_dig_reset, ESP32_RTC_DIG_RESET_GPIO, 1);
+    qdev_init_gpio_in_named(DEVICE(s), esp32_perip_update, "periph-update", 32);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_reset, ESP32_RTC_CPU_RESET_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_cpu_stall, ESP32_RTC_CPU_STALL_GPIO, ESP32_CPU_COUNT);
     qdev_init_gpio_in_named(DEVICE(s), esp32_clk_update, ESP32_RTC_CLK_UPDATE_GPIO, 1);
@@ -739,21 +815,6 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
 }
 
-static void esp32_machine_init_i2c(Esp32SocState *s)
-{
-    /* It should be possible to create an I2C device from the command line,
-     * however for this to work the I2C bus must be reachable from sysbus-default.
-     * At the moment the peripherals are added to an unrelated bus, to avoid being
-     * reset on CPU reset.
-     * If we find a way to decouple peripheral reset from sysbus reset,
-     * we can move them to the sysbus and thus enable creation of i2c devices.
-     */
-    DeviceState *i2c_master = DEVICE(&s->i2c[0]);
-    I2CBus* i2c_bus = I2C_BUS(qdev_get_child_bus(i2c_master, "i2c"));
-    I2CSlave* tmp105 = i2c_slave_create_simple(i2c_bus, "tmp105", 0x48);
-    object_property_set_int(OBJECT(tmp105), "temperature", 25 * 1000, &error_fatal);
-}
-
 static void esp32_machine_init_openeth(Esp32SocState *ss)
 {
     SysBusDevice *sbd;
@@ -826,7 +887,6 @@ static void esp32_machine_init(MachineState *machine)
         esp32_machine_init_psram(ss, (uint32_t) (machine->ram_size / MiB));
     }
 
-    esp32_machine_init_i2c(ss);
 
     esp32_machine_init_openeth(ss);
 

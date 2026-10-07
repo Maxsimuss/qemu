@@ -28,6 +28,7 @@ system_ss.add(files(
   'options.c',
   'postcopy-ram.c',
   'savevm.c',
+  'vmstate-timer.c',
   'socket.c',
   'tls.c',
   'threadinfo.c',

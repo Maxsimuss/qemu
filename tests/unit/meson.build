@@ -127,6 +127,9 @@ endif
 
 if have_system
   tests += {
+    'test-qemu-timer': [],
+    'test-esp32-i2c-vmstate': [migration, io, meson.project_source_root() / 'hw/i2c/esp32_i2c_vmstate.c', meson.project_source_root() / 'migration/vmstate-timer.c'],
+    'test-esp32-i2s-vmstate': [migration, io, meson.project_source_root() / 'hw/misc/esp32_i2s_vmstate.c', meson.project_source_root() / 'migration/vmstate-timer.c'],
     'ptimer-test': ['ptimer-test-stubs.c', meson.project_source_root() / 'hw/core/ptimer.c'],
     'test-iov': [],
     'test-opts-visitor': [testqapi],
