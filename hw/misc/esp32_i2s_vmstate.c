@@ -21,6 +21,16 @@ bool esp32_i2s_mode_supported(Esp32I2SState *s)
 
 bool esp32_i2s_state_valid(Esp32I2SState *s)
 {
+    if (!s->apll_denominator ||
+        s->apll_hz != s->apll_numerator / s->apll_denominator ||
+        (!s->apll_numerator && s->apll_denominator != 1) ||
+        s->apll_hz > 160000000 ||
+        s->apll_numerator > UINT64_MAX / (2 * 63) ||
+        s->apll_denominator > UINT32_MAX ||
+        (__uint128_t)s->apll_numerator >
+            (__uint128_t)160000000 * s->apll_denominator) {
+        return false;
+    }
     if (s->tx.fifo_head >= 64 || s->rx.fifo_head >= 64 ||
         s->tx.fifo_count > 64 || s->rx.fifo_count > 64 ||
         s->tx.bit >= 64 || s->rx.bit > 64 ||
@@ -47,6 +57,10 @@ bool esp32_i2s_state_valid(Esp32I2SState *s)
 int esp32_i2s_post_load(void *opaque, int version)
 {
     Esp32I2SState *s = opaque;
+    if (version < 2) {
+        s->apll_numerator = s->apll_hz;
+        s->apll_denominator = 1;
+    }
     if (!esp32_i2s_state_valid(s)) {
         return -EINVAL;
     }
@@ -131,7 +145,7 @@ static const VMStateDescription vmstate_channel = {
 };
 
 const VMStateDescription vmstate_esp32_i2s = {
-    .name = TYPE_ESP32_I2S, .version_id = 1, .minimum_version_id = 1,
+    .name = TYPE_ESP32_I2S, .version_id = 2, .minimum_version_id = 1,
     .post_load = esp32_i2s_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32I2SState, 64),
@@ -144,9 +158,9 @@ const VMStateDescription vmstate_esp32_i2s = {
         VMSTATE_BOOL(mclk_level, Esp32I2SState),
         VMSTATE_BOOL(enabled, Esp32I2SState),
         VMSTATE_UINT32(apll_hz, Esp32I2SState),
-        VMSTATE_UINT64(apll_numerator, Esp32I2SState),
-        VMSTATE_UINT64(apll_denominator, Esp32I2SState),
         VMSTATE_UINT8_ARRAY(input_level, Esp32I2SState, 24),
+        VMSTATE_UINT64_V(apll_numerator, Esp32I2SState, 2),
+        VMSTATE_UINT64_V(apll_denominator, Esp32I2SState, 2),
         VMSTATE_END_OF_LIST()
     },
 };

@@ -24,7 +24,7 @@
 
 static uint64_t esp32_frc_timer_get_count(Esp32FrcTimerState *s, uint64_t ns_now)
 {
-    if (!s->enable) {
+    if (!s->enable || !s->apb_freq) {
         return s->count_base;
     }
     uint64_t ns_from_base = ns_now - s->ns_base;
@@ -35,11 +35,18 @@ static uint64_t esp32_frc_timer_get_count(Esp32FrcTimerState *s, uint64_t ns_now
 
 static uint64_t esp32_frc_timer_count_to_ns(Esp32FrcTimerState *s, uint64_t count)
 {
+    if (!s->apb_freq) {
+        return INT64_MAX;
+    }
     return muldiv64(count, NANOSECONDS_PER_SECOND * s->prescaler, s->apb_freq);
 }
 
 static void esp32_frc_timer_update_alarm(Esp32FrcTimerState *s, uint64_t ticks_alarm, uint32_t ticks_now, uint64_t ns_now)
 {
+    if (!s->apb_freq) {
+        timer_del(&s->alarm_timer);
+        return;
+    }
     if (ticks_alarm <= ticks_now) {
         ticks_alarm += (1ULL << 32);
     }
@@ -171,8 +178,22 @@ static void esp32_frc_timer_set_apb_freq(Object *obj, Visitor *v,
                                   Error **errp)
 {
     Esp32FrcTimerState *s = ESP32_FRC_TIMER(opaque);
-    visit_type_uint32(v, name, &s->apb_freq, errp);
-
+    uint32_t freq = s->apb_freq;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint32_t count = esp32_frc_timer_get_count(s, now);
+    visit_type_uint32(v, name, &freq, errp);
+    if (errp && *errp) {
+        return;
+    }
+    if (freq == s->apb_freq) {
+        return;
+    }
+    s->count_base = count;
+    s->ns_base = now;
+    s->apb_freq = freq;
+    if (s->enable) {
+        esp32_frc_timer_update_alarm(s, s->alarm_reg, count, now);
+    }
 }
 
 static const MemoryRegionOps esp32_frc_timer_ops = {

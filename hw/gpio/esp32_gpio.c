@@ -129,10 +129,16 @@ static int direct_output(Esp32GpioState *s, unsigned pad, unsigned function)
     }
     if (function == 1 && (pad == 0 || pad == 1 || pad == 3)) {
         unsigned shift = pad == 0 ? 0 : pad == 3 ? 4 : 8;
+        unsigned source = (s->mux[0] >> shift) & 15;
         unsigned clock = s->mux[0] & 15;
         unsigned gate = (s->mux[0] >> shift) & 15;
+        if (source == 6 && (shift == 0 ||
+                            (clock == 6 && gate == 6))) {
+            return pad == 0 ? ESP32_GPIO_CLKOUT1 :
+                   pad == 3 ? ESP32_GPIO_CLKOUT2 : ESP32_GPIO_CLKOUT3;
+        }
         /* TRM 6.33: CLK1 selects 0=I2S0, 15=I2S1; CLK2/3 must
-         * select zero to propagate that source. APLL (6) is not modeled. */
+         * select zero to propagate that I2S source. */
         if ((shift == 0 || gate == 0) && (clock == 0 || clock == 15)) {
             return clock == 0 ? ESP32_GPIO_MCLK0 : ESP32_GPIO_MCLK1;
         }
@@ -165,6 +171,78 @@ static int direct_output(Esp32GpioState *s, unsigned pad, unsigned function)
         return 198; /* U2TXD */
     }
     return -1;
+}
+
+static void gpio_clkout_tick(void *opaque)
+{
+    Esp32GpioClkoutContext *ctx = opaque;
+    Esp32GpioState *s = ctx->owner;
+    unsigned i = ctx->index;
+    static const unsigned signals[] = {
+        ESP32_GPIO_CLKOUT1, ESP32_GPIO_CLKOUT2, ESP32_GPIO_CLKOUT3,
+    };
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t delay = s->clkout_half_whole[i];
+
+    esp32_gpio_set_peripheral_output(s, signals[i], !s->clkout_level[i],
+                                     true, false);
+    s->clkout_phase[i] += s->clkout_half_rem[i];
+    if (s->clkout_phase[i] >= s->clkout_half_div[i]) {
+        s->clkout_phase[i] -= s->clkout_half_div[i];
+        delay++;
+    }
+    timer_mod(s->clkout_timer[i], now + MAX(delay, 1));
+}
+
+void esp32_gpio_set_apll_clkout(Esp32GpioState *s, uint64_t numerator,
+                                uint64_t denominator)
+{
+    static const unsigned signals[] = {
+        ESP32_GPIO_CLKOUT1, ESP32_GPIO_CLKOUT2, ESP32_GPIO_CLKOUT3,
+    };
+    uint64_t divisor;
+    uint64_t half_num;
+    uint64_t now;
+
+    if (!s) {
+        return;
+    }
+    s->apll_clkout_num = numerator;
+    s->apll_clkout_den = denominator;
+    now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    for (unsigned i = 0; i < ARRAY_SIZE(signals); i++) {
+        static const unsigned shifts[] = { 0, 4, 8 };
+        unsigned source = (s->mux[0] >> shifts[i]) & 15;
+        bool apll_selected = source == 6 &&
+            (shifts[i] == 0 || ((s->mux[0] & 15) == 6 && source == 6));
+        uint64_t output_num = apll_selected ? numerator : 0;
+        uint64_t output_den = apll_selected ? denominator : 1;
+        if (s->clkout_num[i] == output_num &&
+            s->clkout_den[i] == output_den) {
+            continue;
+        }
+        timer_del(s->clkout_timer[i]);
+        s->clkout_num[i] = output_num;
+        s->clkout_den[i] = output_den;
+        s->clkout_phase[i] = 0;
+        s->clkout_level[i] = false;
+        if (!output_num || !output_den) {
+            s->clkout_half_whole[i] = 0;
+            s->clkout_half_rem[i] = 0;
+            s->clkout_half_div[i] = 1;
+            esp32_gpio_set_peripheral_output(s, signals[i], false, true, false);
+            continue;
+        }
+        divisor = 2 * output_num;
+        half_num = output_den * NANOSECONDS_PER_SECOND;
+        s->clkout_half_whole[i] = half_num / divisor;
+        s->clkout_half_rem[i] = half_num % divisor;
+        s->clkout_half_div[i] = divisor;
+        /* The first edge is scheduled at floor(H); carry the fractional
+         * half-period from that first interval into the next one. */
+        s->clkout_phase[i] = s->clkout_half_rem[i];
+        timer_mod(s->clkout_timer[i], now + MAX(s->clkout_half_whole[i], 1));
+    }
 }
 
 static Esp32PadLevel merge_drive(Esp32PadLevel a, Esp32PadLevel b)
@@ -344,6 +422,10 @@ static void gpio_resolve_pads(Esp32GpioState *s, uint64_t pads, bool all_inputs)
 
             if (signal == 256) {
                 level = (R(s, pad < 32 ? GPIO_OUT : GPIO_OUT1) >> (pad % 32)) & 1;
+            } else if (signal >= ESP32_GPIO_CLKOUT1 &&
+                       signal <= ESP32_GPIO_CLKOUT3) {
+                level = s->clkout_level[signal - ESP32_GPIO_CLKOUT1];
+                oe = true;
             } else if (signal >= 0 && signal < ESP32_GPIO_OUTPUTS) {
                 known = s->peripheral_known[signal];
                 level = s->peripheral_value[signal];
@@ -442,10 +524,24 @@ static void gpio_resolve(Esp32GpioState *s)
     gpio_resolve_pads(s, (UINT64_C(1) << ESP32_GPIO_PADS) - 1, true);
 }
 
+void esp32_gpio_rebuild_outputs(Esp32GpioState *s)
+{
+    gpio_resolve(s);
+}
+
 void esp32_gpio_set_peripheral_output(Esp32GpioState *s, unsigned signal,
                                      bool level, bool enable, bool open_drain)
 {
     if (!s || signal >= ESP32_GPIO_OUTPUTS) {
+        return;
+    }
+    if (signal >= ESP32_GPIO_CLKOUT1) {
+        unsigned index = signal - ESP32_GPIO_CLKOUT1;
+        if (s->clkout_level[index] != level) {
+            s->clkout_level[index] = level;
+            cache_routes(s);
+            gpio_resolve_pads(s, s->output_pads[signal], false);
+        }
         return;
     }
     if (s->peripheral_known[signal] && s->peripheral_value[signal] == level &&
@@ -667,6 +763,10 @@ static void mux_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
         }
     }
     s->mux[addr / 4] = value & mask;
+    if (addr == 0) {
+        esp32_gpio_set_apll_clkout(s, s->apll_clkout_num,
+                                   s->apll_clkout_den);
+    }
     gpio_resolve(s);
     routing_changed(s);
 }
@@ -690,6 +790,18 @@ static void esp32_gpio_reset_hold(Object *obj, ResetType type)
     Esp32GpioState *s = ESP32_GPIO(obj);
 
     s->resetting = true;
+    for (unsigned i = 0; i < ARRAY_SIZE(s->clkout_timer); i++) {
+        timer_del(s->clkout_timer[i]);
+        s->clkout_num[i] = 0;
+        s->clkout_den[i] = 1;
+        s->clkout_half_whole[i] = 0;
+        s->clkout_half_rem[i] = 0;
+        s->clkout_half_div[i] = 1;
+        s->clkout_phase[i] = 0;
+        s->clkout_level[i] = false;
+    }
+    s->apll_clkout_num = 0;
+    s->apll_clkout_den = 1;
     memset(s->regs, 0, sizeof(s->regs));
     memset(s->mux, 0, sizeof(s->mux));
     for (unsigned pad = 0; pad < 40; pad++) {
@@ -708,49 +820,6 @@ static void esp32_gpio_reset_hold(Object *obj, ResetType type)
     gpio_resolve(s);
     s->resetting = false;
 }
-
-static int gpio_post_load(void *opaque, int version)
-{
-    Esp32GpioState *s = opaque;
-    for (unsigned i = 0; i < ARRAY_SIZE(s->external); i++) {
-        if (s->external[i] > ESP32_PAD_X) {
-            return -EINVAL;
-        }
-    }
-    for (unsigned i = 0; i < ESP32_GPIO_OUTPUTS; i++) {
-        if (s->peripheral_value[i] > 1 || s->peripheral_enable[i] > 1 ||
-            s->peripheral_open_drain[i] > 1 || s->peripheral_known[i] > 1) {
-            return -EINVAL;
-        }
-    }
-    for (unsigned i = 0; i < ESP32_GPIO_PADS; i++) {
-        if (s->input_sample[i] > 1) {
-            return -EINVAL;
-        }
-    }
-    s->resolving = false;
-    s->pending_pads = 0;
-    s->pending_all_inputs = false;
-    gpio_resolve(s);
-    return 0;
-}
-
-static const VMStateDescription vmstate_esp32_gpio = {
-    .name = TYPE_ESP32_GPIO, .version_id = 1, .minimum_version_id = 1,
-    .post_load = gpio_post_load,
-    .fields = (const VMStateField[]) {
-        VMSTATE_UINT32_ARRAY(regs, Esp32GpioState, 0x600 / 4),
-        VMSTATE_UINT32_ARRAY(mux, Esp32GpioState, 0xa0 / 4),
-        VMSTATE_UINT8_ARRAY(peripheral_value, Esp32GpioState, ESP32_GPIO_OUTPUTS),
-        VMSTATE_UINT8_ARRAY(peripheral_enable, Esp32GpioState, ESP32_GPIO_OUTPUTS),
-        VMSTATE_UINT8_ARRAY(peripheral_open_drain, Esp32GpioState, ESP32_GPIO_OUTPUTS),
-        VMSTATE_UINT8_ARRAY(peripheral_known, Esp32GpioState, ESP32_GPIO_OUTPUTS),
-        VMSTATE_UINT8_ARRAY(external, Esp32GpioState,
-                            ESP32_GPIO_PADS * ESP32_GPIO_EXT_DRIVERS),
-        VMSTATE_UINT8_ARRAY(input_sample, Esp32GpioState, ESP32_GPIO_PADS),
-        VMSTATE_END_OF_LIST()
-    },
-};
 
 static void esp32_gpio_realize(DeviceState *dev, Error **errp)
 {
@@ -821,6 +890,14 @@ static void esp32_gpio_init(Object *obj)
     sysbus_init_irq(sbd, &s->nmi);
     sysbus_init_irq(sbd, &s->app_irq);
     sysbus_init_irq(sbd, &s->app_nmi);
+    for (unsigned i = 0; i < ARRAY_SIZE(s->clkout_timer); i++) {
+        s->clkout_context[i].owner = s;
+        s->clkout_context[i].index = i;
+        s->clkout_timer[i] = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+                                          gpio_clkout_tick,
+                                          &s->clkout_context[i]);
+        s->clkout_half_div[i] = 1;
+    }
     qdev_init_gpio_in_named(DEVICE(s), external_drive, "pad-drive",
                             ESP32_GPIO_PADS * ESP32_GPIO_EXT_DRIVERS);
     qdev_init_gpio_out_named(DEVICE(s), s->pad_level, "pad-level", 40);

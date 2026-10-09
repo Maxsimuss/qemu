@@ -3,8 +3,9 @@
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/registerfields.h"
+#include "hw/misc/esp32_reg.h"
 #include "qemu/timer.h"
-#include "qemu/timer.h"
+#include "migration/vmstate.h"
 
 #define TYPE_ESP32_RTC_CNTL "misc.esp32.rtc_cntl"
 #define ESP32_RTC_CNTL(obj) OBJECT_CHECK(Esp32RtcCntlState, (obj), TYPE_ESP32_RTC_CNTL)
@@ -152,3 +153,18 @@ bool esp32_rtc_apll_enabled(const Esp32RtcCntlState *s);
 uint32_t esp32_rtc_get_apll_hz(Esp32RtcCntlState *s);
 bool esp32_rtc_get_apll_rate(Esp32RtcCntlState *s, uint64_t *numerator,
                              uint64_t *denominator);
+extern const VMStateDescription vmstate_esp32_rtc_cntl;
+void esp32_rtc_update_clk(Esp32RtcCntlState *s);
+void esp32_rtc_update_cpu_stall(Esp32RtcCntlState *s);
+
+static inline bool esp32_rtc_apll_powered(const Esp32RtcCntlState *s)
+{
+    if (s->ana_conf_reg & BIT(23)) {
+        return false;
+    }
+    if (s->ana_conf_reg & BIT(24)) {
+        return true;
+    }
+    /* Follow the system power state; this machine has no deep-sleep model. */
+    return true;
+}

@@ -1,0 +1,6 @@
+/build/
+/sdkconfig
+/sdkconfig.old
+/build.log
+/merge.log
+*.wav
