@@ -86,9 +86,9 @@ not be described as complete silicon fidelity without resolving those gaps.
 
 ## Ownership
 
-Root writes this plan and handles commits/push. Luna-high implements the complete
-task and its tests. A separate reviewer checks evidence and acceptance, with at
-most two subagents active. Keep progress concise; no separate prep report.
+Root writes this plan and handles commits; the user pushes from the host. The
+initial implementation used Luna-high. Future subagents use Luna-medium, with at
+most two active. Keep progress concise; no separate prep report.
 
 ## Current acceptance status (2026-10-09)
 
@@ -116,6 +116,16 @@ capacitor calibration and physical phase are not established. Deep-sleep entry
 and wakeup are not implemented by the ESP32 machine, so sleep-specific APLL
 power transitions have not passed acceptance. RMT and LEDC are not modeled and
 have no REF_TICK consumers. Xtensa whole-machine live migration is unsupported;
-only isolated RTC, I2S and GPIO timer VMState streams have been validated. These
-limitations mean this work does not establish complete silicon fidelity or
-production readiness.
+only isolated RTC, I2S and GPIO timer VMState streams have been validated.
+
+Current release scope requires hardware-equivalent behavior observable by the
+firmware: registers, timing, clocks and physical pins. The user expects deep
+sleep to be unused; sleep-specific acceptance is outside this scope while that
+remains true. Whole-machine snapshot/live migration is not a release requirement.
+Its absence does not block OTA or ordinary firmware execution tests.
+
+The remaining APLL fidelity questions are the unverified calibration timing,
+status results and analog register reset values. They require hardware-equivalent
+behavior where observable by firmware. Passing the stock SDK programming and
+audio tests establishes those tested paths, not every possible observation of
+the calibration hardware.
