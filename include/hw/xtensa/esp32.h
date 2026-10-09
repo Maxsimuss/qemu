@@ -60,6 +60,12 @@ typedef struct Esp32SocState {
     BusState periph_bus;
 
     MemoryRegion cpu_specific_mem[ESP32_CPU_COUNT];
+    MemoryRegion syscon_mmio;
+    uint32_t syscon_tick_num[4];
+    uint64_t apb_clock_num;
+    uint64_t apb_clock_den;
 
     uint32_t requested_reset;
+    bool cpu_clock_stall;
+    bool cpu_clock_saved_halted[ESP32_CPU_COUNT];
 } Esp32SocState;

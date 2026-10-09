@@ -36,6 +36,8 @@ Run device tests from the configured QEMU build::
   QTEST_QEMU_BINARY=./qemu-system-xtensa tests/qtest/esp32-i2c-test
   QTEST_QEMU_BINARY=./qemu-system-xtensa tests/qtest/esp32-i2s-dac-test
   QTEST_QEMU_BINARY=./qemu-system-xtensa tests/qtest/esp32-apll-test
+  QTEST_QEMU_BINARY=./qemu-system-xtensa tests/qtest/esp32-apll-mmio-test
+  QTEST_QEMU_BINARY=./qemu-system-xtensa tests/qtest/esp32-ref-tick-test
   tests/unit/test-qemu-timer
   tests/unit/test-icount-idle
   tests/unit/test-esp32-i2s-vmstate
@@ -62,27 +64,24 @@ of all legal firmware:
   capability diagnostics. Enable ``unimp`` logging for detailed register access.
 * TRM v5.8 and SDK disagree about LCD_EN reset and FIFO reset-back status.
   The register table retains SDK values; reset-back transitions are unverified.
-* APLL currently supplies a host-configured frequency fixture, not a
-  guest-programmable APLL. RTC_CNTL_ANA_CONF_REG implements its documented
-  mask/reset and force-power-down precedence. The nominal formula uses
-  SDM0/SDM1 on revision 1 and later; revision 0 ignores them (CLK-3.7).
+* APLL coefficients are guest-programmable through the mask ROM's analog-I2C
+  MMIO protocol. Crystal frequency and silicon revision come from the shared
+  SoC crystal and eFuse state. Revision 0 ignores fractional SDM fields.
+  Calibration completion follows a valid trigger and power/reset state.
+  Force-power-down takes precedence over force-power-up.
   The 350-500 MHz numerator and ODIV range permit outputs below the TRM
   overview's 16 MHz lower bound; official ESP-IDF supports approximately
   5.303031-125 MHz. The model retains the TRM's strict numerator boundaries;
   SDK coefficient search uses inclusive boundaries, so exact endpoints remain
-  a specification discrepancy. Fractional frequency is truncated to integer Hz.
-  CPU/APB derivation for SOC_CLK_SEL=3 and I2S_CLKA_ENA N+b/a and M dividers
-  use this fixture. Coefficients and crystal/revision choices are independent
-  machine properties (apll-sdm0/1/2, apll-odiv, apll-xtal-hz, apll-rev0),
-  rather than guest registers, actual board crystal or eFuse revision inputs.
-  The analog MMIO region remains an unimplemented device. Official SDK APLL
-  configuration writes use analog-I2C/ROM and poll CAL_END: that programming
-  and calibration path does not work here. No successful CAL_END is invented.
-  Sleep-follow gating, SYSCON REF_TICK dividers, APLL CLK_OUT pin toggling,
-  and RTC/APLL migration state remain explicit gaps.
-  CPU/APB behavior with a selected APLL that subsequently loses power is also
-  unverified; I2S source availability is invalidated independently of that mux.
-  Run ``tests/qtest/esp32-apll-test`` for covered fixture/pad regressions.
+  a specification discrepancy. I2S and physical CLK_OUT scheduling retain
+  rational nominal rates. Selected-source loss stalls both CPUs and freezes
+  APB timers. SYSCON REF_TICK dividers feed the existing UART timing model.
+  Isolated RTC/GPIO/I2S save/load tests do not establish whole-machine migration.
+  The 10-microsecond calibration duration, zero CAP/UDF/OVF placeholders,
+  analog register reset defaults and lock phase are unverified silicon behavior.
+  Deep-sleep entry/wakeup and RMT/LEDC REF_TICK consumers remain unmodeled.
+  See ``docs/devel/esp32-apll.md`` and ``esp32-apll-plan.md`` for the evidence,
+  completed acceptance checks and remaining fidelity limits.
 * Frequency/divider tests verify cumulative rational periods. Divider duty-cycle
   details, clock-domain phase, live divider/configuration changes and unspecified
   cross-mode startup/stop sequences are not universally certified.

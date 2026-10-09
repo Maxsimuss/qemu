@@ -32,6 +32,8 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now);
 static void esp32_timg_do_calibration(Esp32TimgState* s);
 static void esp32_timg_int_update(Esp32TimgState *s);
 static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws);
+static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws,
+                                         uint64_t ns_now);
 static void esp32_timg_wdt_update_config(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_feed(Esp32TimgWdtState *ws);
 static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now);
@@ -321,7 +323,31 @@ static void esp32_timg_set_apb_freq(Object *obj, Visitor *v,
                                   Error **errp)
 {
     Esp32TimgState *s = ESP32_TIMG(opaque);
-    visit_type_uint32(v, name, &s->apb_freq_hz, errp);
+    uint32_t freq = s->apb_freq_hz;
+    uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    uint64_t counts[3] = {
+        esp32_timg_timer_get_count(&s->t0, now),
+        esp32_timg_timer_get_count(&s->t1, now),
+        esp32_timg_timer_get_count(&s->lact, now),
+    };
+    uint64_t wdt_count = esp32_timg_wdt_get_count(&s->wdt, now);
+    visit_type_uint32(v, name, &freq, errp);
+    if (errp && *errp) {
+        return;
+    }
+    if (freq == s->apb_freq_hz) {
+        return;
+    }
+    s->apb_freq_hz = freq;
+    Esp32TimgTimerState *timers[] = { &s->t0, &s->t1, &s->lact };
+    for (unsigned i = 0; i < ARRAY_SIZE(timers); i++) {
+        timers[i]->count_base = counts[i];
+        timers[i]->ns_base = now;
+        esp32_timg_timer_update_alarm(timers[i], now);
+    }
+    s->wdt.count_base = wdt_count;
+    s->wdt.ns_base = now;
+    esp32_timg_wdt_arm(&s->wdt, now);
     TIMG_DEBUG_LOG("%s: TG%d apb_freq_hz=%d\n", __func__, s->id, s->apb_freq_hz);
 }
 
@@ -338,6 +364,14 @@ static void esp32_timg_do_calibration(Esp32TimgState* s)
 
     s->rtc_cal_value = muldiv64(s->xtal_freq_hz, s->rtc_cal_max, cal_clk_freq);
     s->rtc_cal_ready = true;
+}
+
+void esp32_timg_set_rtc_clock_sources(Esp32TimgState *s,
+                                      uint32_t xtal_freq_hz,
+                                      uint32_t rtc_slow_freq_hz)
+{
+    s->xtal_freq_hz = xtal_freq_hz;
+    s->rtc_slow_freq_hz = rtc_slow_freq_hz;
 }
 
 static void esp32_timg_timer_cb(void *opaque)
@@ -404,7 +438,7 @@ static int esp32_timg_timer_direction(Esp32TimgTimerState *s)
 
 static uint64_t esp32_timg_timer_get_count(Esp32TimgTimerState *s, uint64_t ns_now)
 {
-    if (!s->en) {
+    if (!s->en || !s->parent->apb_freq_hz) {
         return s->count_base;
     }
     uint64_t ns_from_base = ns_now - s->ns_base;
@@ -418,6 +452,10 @@ static uint64_t esp32_timg_ticks_to_ns(uint64_t count, uint32_t divider,
                                       uint32_t apb_hz)
 {
     uint64_t low, high;
+
+    if (!apb_hz) {
+        return INT64_MAX;
+    }
 
     /* muldiv64's multiplier is only 32 bits. Keep the full product for large
      * prescalers instead of overflowing or truncating APB to whole MHz. */
@@ -479,7 +517,7 @@ static void esp32_timg_timer_reload(Esp32TimgTimerState *ts, uint64_t ns_now)
 
 static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_now)
 {
-    if (!ts->en || !ts->alarm) {
+    if (!ts->en || !ts->alarm || !ts->parent->apb_freq_hz) {
         timer_del(&ts->alarm_timer);
         return;
     }
@@ -508,7 +546,7 @@ static bool esp32_timg_wdt_protected(Esp32TimgWdtState *ws)
 
 static uint64_t esp32_timg_wdt_get_count(Esp32TimgWdtState *ws, uint64_t ns_now)
 {
-    if (!ws->en) {
+    if (!ws->en || !ws->parent->apb_freq_hz) {
         return ws->count_base;
     }
     uint64_t ns_from_base = ns_now - ws->ns_base;
@@ -565,7 +603,8 @@ static void esp32_timg_wdt_arm(Esp32TimgWdtState *ws, uint64_t ns_now)
 {
     timer_del(&ws->stage_timer);
 
-    if (ws->parent->wdt_disable || !(ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode))) {
+    if (ws->parent->wdt_disable || !ws->parent->apb_freq_hz ||
+        !(ws->en || (ws->flashboot_en && ws->parent->flash_boot_mode))) {
         return;
     }
 

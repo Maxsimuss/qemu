@@ -53,12 +53,55 @@ void esp32_uart_update_irq(ESP32UARTState *s)
     qemu_set_irq(s->irq, irq);
 }
 
+static void uart_rebase_timer(QEMUTimer *timer, int64_t *paused_ns,
+                              uint64_t *pause_num, uint64_t *pause_den,
+                              uint64_t old_num, uint64_t old_den,
+                              uint64_t new_num, uint64_t new_den)
+{
+    int64_t remaining;
+    uint64_t source_num, source_den;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (timer_pending(timer)) {
+        remaining = MAX(timer->expire_time - now, 1);
+        source_num = old_num;
+        source_den = old_den;
+    } else if (*paused_ns) {
+        remaining = *paused_ns;
+        source_num = *pause_num;
+        source_den = *pause_den;
+    } else {
+        return;
+    }
+    timer_del(timer);
+    if (!new_num || !new_den) {
+        *paused_ns = remaining;
+        *pause_num = source_num;
+        *pause_den = source_den ? source_den : 1;
+        return;
+    }
+    if (source_num && source_den) {
+        __uint128_t scaled = (__uint128_t)remaining * source_num * new_den;
+        __uint128_t denominator = (__uint128_t)source_den * new_num;
+        remaining = MAX((uint64_t)(scaled / denominator), 1);
+    }
+    *paused_ns = 0;
+    *pause_num = *pause_den = 0;
+    timer_mod_ns(timer, now + remaining);
+}
+
 
 void esp32_uart_set_rx_timeout(ESP32UARTState *s)
 {
-    if (s->rx_tout_ena) {
+    uint64_t clkdiv = (FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV)
+                       << 4) + FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV,
+                                          CLKDIV_FRAG);
+    if (s->rx_tout_ena && clkdiv && s->apb_clock_num) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        int64_t rx_timeout_ns = now + s->rx_tout_thres * NANOSECONDS_PER_SECOND / s->baud_rate;
+        __uint128_t numerator = (__uint128_t)s->rx_tout_thres * clkdiv *
+                                NANOSECONDS_PER_SECOND * s->apb_clock_den;
+        __uint128_t denominator = (__uint128_t)16 * s->apb_clock_num;
+        int64_t rx_timeout_ns = now + MAX((uint64_t)(numerator / denominator), 1);
         /* If throttling is done, make sure timeout doesn't happen before more data
          * is allowed to come. Offset it by 1ms.
          */
@@ -70,6 +113,58 @@ void esp32_uart_set_rx_timeout(ESP32UARTState *s)
         timer_del(&s->rx_timeout_timer);
         s->rxfifo_tout = false;
     }
+}
+
+static void uart_update_baud_rate(ESP32UARTState *s, bool refresh_timeout)
+{
+    uint64_t clkdiv = (FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV)
+                       << 4) + FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV,
+                                          CLKDIV_FRAG);
+    bool apb = s->reg[R_UART_CONF0] & ESP32_UART_TICK_REF_ALWAYS_ON;
+    uint64_t clock_num = apb ? s->apb_clock_num : s->ref_tick_num;
+    uint64_t clock_den = apb ? s->apb_clock_den : s->ref_tick_den;
+    uint64_t throttle_den = clock_den * MAX(clkdiv, 1);
+    uart_rebase_timer(&s->throttle_timer, &s->throttle_paused_ns,
+                      &s->throttle_pause_num, &s->throttle_pause_den,
+                      s->active_clock_num, s->active_clock_den,
+                      clock_num, throttle_den);
+    s->active_clock_num = clock_num;
+    s->active_clock_den = throttle_den;
+
+    if (!clock_num || !clock_den) {
+        s->baud_rate = 0;
+        s->throttle_rx = false;
+    } else if (!clkdiv) {
+        s->baud_rate = 115200;
+    } else {
+        __uint128_t rate = (__uint128_t)clock_num * 16 /
+                           ((__uint128_t)clock_den * clkdiv);
+        s->baud_rate = MIN((uint64_t)rate, UINT_MAX);
+    }
+    if (refresh_timeout) {
+        esp32_uart_set_rx_timeout(s);
+    }
+}
+
+void esp32_uart_set_clock_sources(ESP32UARTState *s,
+                                  uint64_t apb_num, uint64_t apb_den,
+                                  uint64_t ref_tick_num,
+                                  uint64_t ref_tick_den)
+{
+    if (s->apb_clock_num == apb_num && s->apb_clock_den == (apb_den ? apb_den : 1) &&
+        s->ref_tick_num == ref_tick_num &&
+        s->ref_tick_den == (ref_tick_den ? ref_tick_den : 1)) {
+        return;
+    }
+    uart_rebase_timer(&s->rx_timeout_timer, &s->rx_timeout_paused_ns,
+                      &s->rx_timeout_pause_num, &s->rx_timeout_pause_den,
+                      s->apb_clock_num, s->apb_clock_den,
+                      apb_num, apb_den ? apb_den : 1);
+    s->apb_clock_num = apb_num;
+    s->apb_clock_den = apb_den ? apb_den : 1;
+    s->ref_tick_num = ref_tick_num;
+    s->ref_tick_den = ref_tick_den ? ref_tick_den : 1;
+    uart_update_baud_rate(s, false);
 }
 
 
@@ -154,16 +249,14 @@ static void uart_write(void *opaque, hwaddr addr,
 
     case A_UART_CLKDIV: {
         s->reg[addr / 4] = value;
-        unsigned clkdiv = (FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV) << 4) +
-                          FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV, CLKDIV_FRAG);
-        unsigned baud_rate = 115200;
-        if (clkdiv != 0) {
-            /* FIXME: this should depend on the APB frequency */
-            baud_rate = (unsigned) ((40000000ULL << 4) / clkdiv);
-        }
-        s->baud_rate = baud_rate;
+        uart_update_baud_rate(s, true);
         break;
     }
+
+    case A_UART_CONF0:
+        s->reg[addr / 4] = value;
+        uart_update_baud_rate(s, false);
+        break;
 
     case A_UART_AUTOBAUD:
         /* If autobaud is enabled, pretend that sufficient number of edges on the RXD line
@@ -268,9 +361,23 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
      * (which most likely means that more data will come).
      */
     if (fifo8_is_full(&s->rx_fifo)) {
+        bool apb = s->reg[R_UART_CONF0] & ESP32_UART_TICK_REF_ALWAYS_ON;
+        uint64_t clock_num = apb ? s->apb_clock_num : s->ref_tick_num;
+        uint64_t clock_den = apb ? s->apb_clock_den : s->ref_tick_den;
+        uint64_t clkdiv = (FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV,
+                                     CLKDIV) << 4) +
+                          FIELD_EX32(s->reg[R_UART_CLKDIV], UART_CLKDIV,
+                                     CLKDIV_FRAG);
+        if (!clock_num || !clock_den || !clkdiv) {
+            esp32_uart_update_irq(s);
+            return;
+        }
         s->throttle_rx = true;
         const int bits_per_symbol = 10;
-        int64_t throttle_time_ns = (int64_t) UART_FIFO_LENGTH * bits_per_symbol * NANOSECONDS_PER_SECOND / s->baud_rate;
+        __uint128_t numerator = (__uint128_t)UART_FIFO_LENGTH * bits_per_symbol *
+                                clkdiv * NANOSECONDS_PER_SECOND * clock_den;
+        __uint128_t denominator = (__uint128_t)16 * clock_num;
+        int64_t throttle_time_ns = MAX((uint64_t)(numerator / denominator), 1);
         timer_mod_ns(&s->throttle_timer,
                      qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
                      throttle_time_ns);
@@ -283,7 +390,7 @@ static void uart_receive(void *opaque, const uint8_t *buf, int size)
 static int uart_can_receive(void *opaque)
 {
     ESP32UARTState *s = ESP32_UART(opaque);
-    if (s->throttle_rx) {
+    if (s->throttle_rx || !s->baud_rate) {
         return 0;
     }
     return fifo8_num_free(&s->rx_fifo);
@@ -319,6 +426,7 @@ static void esp32_uart_reset_hold(Object *obj, ResetType type)
     s->reg[R_UART_INT_RAW] = 0;
     s->reg[R_UART_INT_ENA] = 0;
     s->reg[R_UART_AUTOBAUD] = 0;
+    s->reg[R_UART_CONF0] = ESP32_UART_TICK_REF_ALWAYS_ON;
     /* Default baud rate divider after reset */
     s->reg[R_UART_CLKDIV] = FIELD_DP32(0, UART_CLKDIV, CLKDIV, 0x2B6);
     s->baud_rate = 115200;
@@ -333,6 +441,7 @@ static void esp32_uart_reset_hold(Object *obj, ResetType type)
     s->rx_tout_ena = false;
     s->tx_empty_threshold = 0;
     s->rx_full_threshold = 0;
+    uart_update_baud_rate(s, true);
     s->rx_tout_thres = 0;
     qemu_irq_lower(s->irq);
 }
@@ -367,6 +476,10 @@ static void esp32_uart_init(Object *obj)
     fifo8_create(&s->rx_fifo, UART_FIFO_LENGTH);
     timer_init_ns(&s->throttle_timer, QEMU_CLOCK_VIRTUAL, uart_throttle_timer_cb, s);
     timer_init_ns(&s->rx_timeout_timer, QEMU_CLOCK_VIRTUAL, uart_rx_timeout_timer_cb, s);
+    s->apb_clock_num = 40000000;
+    s->apb_clock_den = 1;
+    s->ref_tick_num = 1000000;
+    s->ref_tick_den = 1;
 }
 
 

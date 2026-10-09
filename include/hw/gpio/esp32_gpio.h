@@ -7,6 +7,8 @@
 
 #include "hw/sysbus.h"
 #include "hw/registerfields.h"
+#include "migration/vmstate.h"
+#include "qemu/timer.h"
 
 #define TYPE_ESP32_GPIO "esp32.gpio"
 #define ESP32_GPIO(obj) OBJECT_CHECK(Esp32GpioState, (obj), TYPE_ESP32_GPIO)
@@ -14,7 +16,11 @@
 #define ESP32_GPIO_CLASS(klass) OBJECT_CLASS_CHECK(Esp32GpioClass, (klass), TYPE_ESP32_GPIO)
 #define ESP32_GPIO_PADS 40
 #define ESP32_GPIO_SIGNALS 256
-#define ESP32_GPIO_OUTPUTS 259
+#define ESP32_GPIO_CLKOUT1 259
+#define ESP32_GPIO_CLKOUT2 260
+#define ESP32_GPIO_CLKOUT3 261
+#define ESP32_GPIO_OUTPUTS_V1 259
+#define ESP32_GPIO_OUTPUTS 262
 #define ESP32_GPIO_MCLK0 257
 #define ESP32_GPIO_MCLK1 258
 #define ESP32_GPIO_EXT_DRIVERS 4
@@ -30,7 +36,13 @@ typedef enum Esp32PadLevel {
     ESP32_PAD_X,
 } Esp32PadLevel;
 
-typedef struct Esp32GpioState {
+typedef struct Esp32GpioState Esp32GpioState;
+typedef struct Esp32GpioClkoutContext {
+    Esp32GpioState *owner;
+    unsigned index;
+} Esp32GpioClkoutContext;
+
+struct Esp32GpioState {
     SysBusDevice parent_obj;
     MemoryRegion iomem;
     MemoryRegion io_mux;
@@ -45,10 +57,21 @@ typedef struct Esp32GpioState {
     uint32_t strap_mode;
     uint32_t regs[0x600 / 4];
     uint32_t mux[0xa0 / 4];
-    uint8_t peripheral_value[ESP32_GPIO_OUTPUTS];
-    uint8_t peripheral_enable[ESP32_GPIO_OUTPUTS];
-    uint8_t peripheral_open_drain[ESP32_GPIO_OUTPUTS];
-    uint8_t peripheral_known[ESP32_GPIO_OUTPUTS];
+    uint8_t peripheral_value[ESP32_GPIO_OUTPUTS_V1];
+    uint8_t peripheral_enable[ESP32_GPIO_OUTPUTS_V1];
+    uint8_t peripheral_open_drain[ESP32_GPIO_OUTPUTS_V1];
+    uint8_t peripheral_known[ESP32_GPIO_OUTPUTS_V1];
+    QEMUTimer *clkout_timer[3];
+    Esp32GpioClkoutContext clkout_context[3];
+    uint64_t apll_clkout_num;
+    uint64_t apll_clkout_den;
+    uint64_t clkout_num[3];
+    uint64_t clkout_den[3];
+    uint64_t clkout_half_whole[3];
+    uint64_t clkout_half_rem[3];
+    uint64_t clkout_half_div[3];
+    uint64_t clkout_phase[3];
+    bool clkout_level[3];
     uint8_t external[ESP32_GPIO_PADS * ESP32_GPIO_EXT_DRIVERS];
     uint8_t resolved[ESP32_GPIO_PADS];
     uint8_t drive[ESP32_GPIO_PADS];
@@ -69,7 +92,7 @@ typedef struct Esp32GpioState {
     int64_t trace_time;
     int64_t trace_last_virtual;
     int64_t trace_epoch;
-} Esp32GpioState;
+};
 
 typedef struct Esp32GpioClass {
     SysBusDeviceClass parent_class;
@@ -88,5 +111,9 @@ void esp32_gpio_remove_pad_listener(Esp32GpioState *s, unsigned pad, qemu_irq si
 void esp32_gpio_add_routing_listener(Esp32GpioState *s, qemu_irq sink);
 void esp32_gpio_remove_routing_listener(Esp32GpioState *s, qemu_irq sink);
 bool esp32_gpio_output_is_routed(Esp32GpioState *s, unsigned signal);
+void esp32_gpio_set_apll_clkout(Esp32GpioState *s, uint64_t numerator,
+                                uint64_t denominator);
+void esp32_gpio_rebuild_outputs(Esp32GpioState *s);
+extern const VMStateDescription vmstate_esp32_gpio;
 
 #endif

@@ -99,6 +99,10 @@ typedef struct Esp32TimgState {
     uint32_t rtc_cal_value;
 } Esp32TimgState;
 
+void esp32_timg_set_rtc_clock_sources(Esp32TimgState *s,
+                                     uint32_t xtal_freq_hz,
+                                     uint32_t rtc_slow_freq_hz);
+
 #define ESP32_TIMG_WDT_CPU_RESET_GPIO   "mwdt-cpu-reset"
 #define ESP32_TIMG_WDT_SYS_RESET_GPIO   "mwdt-sys-reset"
 

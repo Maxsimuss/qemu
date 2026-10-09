@@ -118,7 +118,9 @@ static void initialize(Esp32I2SState *s, bool fill)
     s->mclk_paused_ns = 25;
     s->mclk_level = true;
     s->enabled = true;
-    s->apll_hz = 8000000;
+    s->apll_hz = 31666666;
+    s->apll_numerator = 95000000;
+    s->apll_denominator = 3;
     timer_mod_ns(s->tx.timer, 12345);
     timer_mod_ns(s->rx.timer, 23456);
     timer_mod_ns(s->mclk_timer, 34567);
@@ -131,7 +133,8 @@ static void destroy(Esp32I2SState *s)
     timer_free(s->mclk_timer);
 }
 
-static int roundtrip(Esp32I2SState *source, Esp32I2SState *dest)
+static int roundtrip_version(Esp32I2SState *source, Esp32I2SState *dest,
+                             unsigned version)
 {
     g_autofree char *name = NULL;
     int fd = g_file_open_tmp("esp32-i2s-state-XXXXXX", &name, NULL);
@@ -139,16 +142,37 @@ static int roundtrip(Esp32I2SState *source, Esp32I2SState *dest)
     QIOChannel *ioc = QIO_CHANNEL(qio_channel_file_new_fd(dup(fd)));
     QEMUFile *f = qemu_file_new_output(ioc);
     object_unref(OBJECT(ioc));
-    g_assert_cmpint(vmstate_save_state(f, &vmstate_esp32_i2s, source, NULL), ==, 0);
+    g_assert_cmpint(vmstate_save_state_v(f, &vmstate_esp32_i2s, source, NULL, version, NULL), ==, 0);
     g_assert_cmpint(qemu_fclose(f), ==, 0);
     g_assert_cmpint(lseek(fd, 0, SEEK_SET), ==, 0);
     ioc = QIO_CHANNEL(qio_channel_file_new_fd(fd));
     f = qemu_file_new_input(ioc);
     object_unref(OBJECT(ioc));
-    int result = vmstate_load_state(f, &vmstate_esp32_i2s, dest, 1);
+    int result = vmstate_load_state(f, &vmstate_esp32_i2s, dest, version);
     qemu_fclose(f);
     unlink(name);
     return result;
+}
+
+static int roundtrip(Esp32I2SState *source, Esp32I2SState *dest)
+{
+    return roundtrip_version(source, dest, vmstate_esp32_i2s.version_id);
+}
+
+static void test_restore_version1(void)
+{
+    Esp32I2SState source, dest;
+    initialize(&source, true);
+    initialize(&dest, false);
+    g_assert_cmpint(roundtrip_version(&source, &dest, 1), ==, 0);
+    g_assert_cmpuint(dest.apll_hz, ==, 31666666);
+    g_assert_cmpuint(dest.apll_numerator, ==, 31666666);
+    g_assert_cmpuint(dest.apll_denominator, ==, 1);
+    g_assert_cmpmem(dest.input_level, sizeof(dest.input_level),
+                    source.input_level, sizeof(source.input_level));
+    g_assert_cmpint(dest.tx.timer->expire_time, ==, 12345);
+    destroy(&source);
+    destroy(&dest);
 }
 
 static void compare_channel(Esp32I2SChannel *a, Esp32I2SChannel *b)
@@ -175,7 +199,9 @@ static void test_restore(void)
     g_assert_cmpint(dest.mclk_paused_ns, ==, 25);
     g_assert_true(dest.mclk_level);
     g_assert_true(dest.enabled);
-    g_assert_cmpuint(dest.apll_hz, ==, 8000000);
+    g_assert_cmpuint(dest.apll_hz, ==, 31666666);
+    g_assert_cmpuint(dest.apll_numerator, ==, 95000000);
+    g_assert_cmpuint(dest.apll_denominator, ==, 3);
     for (unsigned bit = 0; bit < 24; bit++) {
         g_assert_cmpint(output_enable[140 + bit], ==, 1);
         g_assert_cmpint(output_level[140 + bit], ==, (0x9abcde >> bit) & 1);
@@ -213,6 +239,13 @@ static void test_reject_invalid(void)
     source.input_level[4] = 0;
     source.tx.fifo_flags[3] = 8;
     g_assert_false(esp32_i2s_state_valid(&source));
+    source.tx.fifo_flags[3] = 3;
+    source.apll_denominator = 0;
+    g_assert_false(esp32_i2s_state_valid(&source));
+    source.apll_numerator = UINT64_C(1) << 63;
+    source.apll_denominator = UINT64_C(1) << 40;
+    source.apll_hz = 1u << 23;
+    g_assert_false(esp32_i2s_state_valid(&source));
     destroy(&source);
     destroy(&dest);
 }
@@ -225,5 +258,6 @@ int main(int argc, char **argv)
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
     g_test_add_func("/esp32/i2s/vmstate/restore-stream-and-timers", test_restore);
     g_test_add_func("/esp32/i2s/vmstate/reject-invalid", test_reject_invalid);
+    g_test_add_func("/esp32/i2s/vmstate/restore-version1", test_restore_version1);
     return g_test_run();
 }

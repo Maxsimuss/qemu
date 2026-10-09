@@ -7,6 +7,7 @@
 #include "hw/registerfields.h"
 
 #define UART_FIFO_LENGTH 128
+#define ESP32_UART_TICK_REF_ALWAYS_ON BIT(27)
 
 #define TYPE_ESP32_UART "esp_soc.uart"
 #define ESP32_UART_GET_CLASS(obj) OBJECT_GET_CLASS(ESP32UARTClass, obj, TYPE_ESP32_UART)
@@ -88,6 +89,18 @@ typedef struct ESPUARTState {
     bool throttle_rx;
     bool rxfifo_tout;
     unsigned baud_rate;
+    uint64_t apb_clock_num;
+    uint64_t apb_clock_den;
+    uint64_t ref_tick_num;
+    uint64_t ref_tick_den;
+    uint64_t active_clock_num;
+    uint64_t active_clock_den;
+    int64_t rx_timeout_paused_ns;
+    uint64_t rx_timeout_pause_num;
+    uint64_t rx_timeout_pause_den;
+    int64_t throttle_paused_ns;
+    uint64_t throttle_pause_num;
+    uint64_t throttle_pause_den;
 
     Fifo8 rx_fifo;
     Fifo8 tx_fifo;
@@ -126,3 +139,7 @@ void esp32_uart_set_rx_timeout(ESP32UARTState *s);
  * the configured threshold.
  */
 void esp32_uart_update_irq(ESP32UARTState *s);
+void esp32_uart_set_clock_sources(ESP32UARTState *s,
+                                 uint64_t apb_num, uint64_t apb_den,
+                                 uint64_t ref_tick_num,
+                                 uint64_t ref_tick_den);

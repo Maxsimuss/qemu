@@ -31,8 +31,10 @@ BIAS_I2C_FORCE_PD (OPTIONS0 bit 18) and force/sleep behavior as well as ANA_CONF
 Primary evidence: Espressif's esp-rom-elfs repository; ESP-IDF master
 components/soc/esp32/include/soc/regi2c_defs.h and regi2c_apll.h;
 components/esp_hal_clock/esp32/include/hal/clk_tree_ll.h; TRM 7.2.4/7.2.7.
-The present audit has no primary evidence for analog register reset values,
-bus transaction duration, calibration cycle count, varactor transfer law,
+The present audit has no primary evidence for analog register reset values. QEMU
+currently resets the ten-byte APLL analog bank to zero as an implementation
+placeholder, not a silicon claim. Evidence is also absent for bus transaction
+duration, calibration cycle count, varactor transfer law,
 CAL_CAP/UDF/OVF results, or physical lock phase. These are outstanding evidence
 requirements. A deterministic nominal model may enable SDK execution, but must
 not be described as complete silicon fidelity without resolving those gaps.
@@ -87,3 +89,33 @@ not be described as complete silicon fidelity without resolving those gaps.
 Root writes this plan and handles commits/push. Luna-high implements the complete
 task and its tests. A separate reviewer checks evidence and acceptance, with at
 most two subagents active. Keep progress concise; no separate prep report.
+
+## Current acceptance status (2026-10-09)
+
+The documented digital paths now have raw-MMIO and guest-level coverage. Final
+focused regressions passed: APLL 27, raw MMIO 12, REF_TICK/UART 10; GPIO 4,
+interrupt controller 3, I2C 16, I2S 57 and DAC 17; RTC/GPIO/I2S/I2C isolated
+migration 3/4/3/3; timer 1 and idle batching 6. The independent dual-core TCG
+clock-gate check passed with WFI, reset and pending-interrupt behavior. ROM
+analog-I2C access, calibration sequencing/cancellation, force-power handling,
+both I2S rational clocks, CLK_OUT pad edges, CPU/APB source loss and recovery,
+REF_TICK register/rate selection, UART REF_TICK pacing and timeout rescaling,
+shared RTC calibration clocks, and isolated RTC/I2S/GPIO timer VMState are
+implemented and covered by their focused tests. The independent full-tone audio
+captures passed on I2S0 at 16 kHz (80,000 tone frames; 0.753x realtime) and I2S1
+at 32 kHz (160,000 tone frames; 0.232x realtime). Both include firmware-driven
+I2S disable/re-enable, and the verifier checked the complete waveform, stereo
+samples, and zero padding. The IDF command audit found 0 of 1,045 application and bootloader compile
+commands bypassing ccache. The rate-specific WAVs are retained in the fixture's
+ignored build directory; `tests/firmware/esp32-apll-dac/README.md` gives the
+reproduction commands.
+
+The 10 microsecond calibration completion delay is still an unverified virtual
+time approximation. CAL_CAP, UDF and OVF remain placeholders; analog lock,
+capacitor calibration and physical phase are not established. Deep-sleep entry
+and wakeup are not implemented by the ESP32 machine, so sleep-specific APLL
+power transitions have not passed acceptance. RMT and LEDC are not modeled and
+have no REF_TICK consumers. Xtensa whole-machine live migration is unsupported;
+only isolated RTC, I2S and GPIO timer VMState streams have been validated. These
+limitations mean this work does not establish complete silicon fidelity or
+production readiness.

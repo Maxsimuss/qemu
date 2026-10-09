@@ -1,0 +1,6 @@
+# This file was generated using idf.py save-defconfig or menuconfig [D] key. It can be edited manually.
+# Espressif IoT Development Framework (ESP-IDF) 6.2.0 Project Minimal Configuration
+#
+CONFIG_ESPTOOLPY_FLASHSIZE_4MB=y
+# CONFIG_MBEDTLS_X509_TRUSTED_CERT_CALLBACK is not set
+# CONFIG_MBEDTLS_CERTIFICATE_BUNDLE_CROSS_SIGNED_VERIFY is not set

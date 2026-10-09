@@ -246,6 +246,96 @@ static void test_power_dominance(void)
     finish(q, efuse_name);
 }
 
+static void test_masks_and_bus_reset(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    static const unsigned masks[] = {
+        0xff, 0x7f, 0xff, 0, 0xdf, 0x7f, 0x1f, 0x3f, 0xff, 0xff,
+    };
+    /* Masks follow the named fields in ESP-IDF regi2c_apll.h. Reset values
+     * of this analog bank are unverified and are not asserted here. */
+    for (unsigned reg = 0; reg < G_N_ELEMENTS(masks); reg++) {
+        apll_write(q, reg, 0xff);
+        g_assert_cmphex(apll_read(q, reg), ==, masks[reg]);
+    }
+    apll_write(q, 9, 0x5a);
+    uint64_t command = ANA_APB + APLL_HOST * 4;
+    qtest_writel(q, command, COMMAND_WRITE | (0xa5 << 16) | (9 << 8) |
+                               APLL_BLOCK);
+    g_assert_true(qtest_readl(q, command) & COMMAND_BUSY);
+    g_assert_true(qtest_readl(q, ANA_DPORT + APLL_HOST * 4) & COMMAND_BUSY);
+    qtest_writel(q, ANA_DPORT + ANA_CONFIG, 0x3ff00);
+    qtest_clock_step(q, 1000000);
+    g_assert_false(qtest_readl(q, command) & COMMAND_BUSY);
+    qtest_writel(q, ANA_APB + ANA_CONFIG, 0x3ff00 & ~ANA_APLL_DISABLED);
+    g_assert_cmphex(apll_read(q, 9), ==, 0x5a);
+    finish(q, efuse_name);
+}
+
+static void test_cancelled_calibration(gconstpointer opaque)
+{
+    unsigned cancellation = GPOINTER_TO_UINT(opaque);
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    calibrate(q, true, 0);
+    apll_write(q, 0, 0x0f);
+    apll_write(q, 0, 0x3f);
+    /* Exercise cancellation during pending calibration. No assertion about
+     * a silicon duration is made; only the model's eventual completion is
+     * used, and cancellation must prevent a stale completion afterward. */
+    if (cancellation == 0) {
+        qtest_writel(q, RTC_ANA_CONF, FORCE_PD);
+    } else if (cancellation == 1) {
+        apll_write(q, 0, 0x0f);
+    } else if (cancellation == 2) {
+        apll_write(q, 7, 0); /* Invalid VCO: 40 MHz * 4 = 160 MHz. */
+    } else {
+        qtest_qmp_assert_success(q, "{ 'execute': 'system_reset' }");
+        qtest_writel(q, ANA_APB + ANA_CONFIG, 0x3ff00 & ~ANA_APLL_DISABLED);
+    }
+    qtest_clock_step(q, 1000000);
+    g_assert_cmphex(apll_read(q, 3) & CAL_END, ==, 0);
+    finish(q, efuse_name);
+}
+
+static void test_reprogram_and_recover(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    calibrate(q, true, 0);
+    start_clock(q);
+    qtest_clock_step(q, 2000);
+    g_assert_true(qtest_readl(q, GPIO + 0x3c) & (1 << 18));
+    apll_write(q, 8, 0x80);
+    g_assert_cmphex(apll_read(q, 3) & CAL_END, ==, 0);
+    uint32_t held = qtest_readl(q, GPIO + 0x3c) & (1 << 18);
+    for (unsigned sample = 0; sample < 20; sample++) {
+        qtest_clock_step(q, 1000);
+        g_assert_cmphex(qtest_readl(q, GPIO + 0x3c) & (1 << 18), ==, held);
+    }
+    calibrate(q, true, 0);
+    qtest_writel(q, I2S + 8, 0);
+    qtest_writel(q, I2S + 8, 1 << 4);
+    qtest_clock_step(q, 1999);
+    g_assert_false(qtest_readl(q, GPIO + 0x3c) & (1 << 18));
+    qtest_clock_step(q, 1);
+    g_assert_true(qtest_readl(q, GPIO + 0x3c) & (1 << 18));
+    finish(q, efuse_name);
+}
+
+static void test_bias_power(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    apll_write(q, 9, 0x5a);
+    qtest_writel(q, RTC_OPTIONS0, qtest_readl(q, RTC_OPTIONS0) | (1u << 18));
+    apll_write(q, 9, 0xa5);
+    qtest_writel(q, RTC_OPTIONS0, qtest_readl(q, RTC_OPTIONS0) & ~(1u << 18));
+    g_assert_cmphex(apll_read(q, 9), ==, 0x5a);
+    finish(q, efuse_name);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -256,5 +346,15 @@ int main(int argc, char **argv)
     qtest_add_data_func("/esp32/apll-mmio/fraction-ignored-rev0",
                        GINT_TO_POINTER(false), test_fractional_trace);
     qtest_add_func("/esp32/apll-mmio/power-dominance", test_power_dominance);
+    qtest_add_func("/esp32/apll-mmio/masks-and-bus-reset", test_masks_and_bus_reset);
+    static const char *cancel_names[] = { "power", "analog-reset",
+        "invalid-coefficient", "system-reset" };
+    for (unsigned i = 0; i < G_N_ELEMENTS(cancel_names); i++) {
+        g_autofree char *path = g_strdup_printf(
+            "/esp32/apll-mmio/cancel-calibration/%s", cancel_names[i]);
+        qtest_add_data_func(path, GUINT_TO_POINTER(i), test_cancelled_calibration);
+    }
+    qtest_add_func("/esp32/apll-mmio/reprogram-and-recover", test_reprogram_and_recover);
+    qtest_add_func("/esp32/apll-mmio/bias-power", test_bias_power);
     return g_test_run();
 }

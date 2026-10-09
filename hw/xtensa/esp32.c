@@ -159,6 +159,12 @@ static void esp32_soc_reset(DeviceState *dev)
     if (s->requested_reset == 0) {
         s->requested_reset = ESP32_SOC_RESET_ALL;
     }
+    if (s->requested_reset & (ESP32_SOC_RESET_RTC | ESP32_SOC_RESET_PERIPH)) {
+        s->syscon_tick_num[0] = 39;
+        s->syscon_tick_num[1] = 79;
+        s->syscon_tick_num[2] = 11;
+        s->syscon_tick_num[3] = 99;
+    }
     if (s->requested_reset & ESP32_SOC_RESET_RTC) {
         device_cold_reset(DEVICE(&s->rtc_cntl));
     }
@@ -214,15 +220,91 @@ static void esp32_cpu_stall(void* opaque, int n, int level)
 
     bool stall;
     if (n == 0) {
-        stall = s->rtc_cntl.cpu_stall_state[0];
+        stall = s->cpu_clock_stall || s->rtc_cntl.cpu_stall_state[0];
     } else {
-        stall = s->rtc_cntl.cpu_stall_state[1] || s->dport.appcpu_stall_state || (!s->dport.appcpu_clkgate_state);
+        stall = s->cpu_clock_stall || s->rtc_cntl.cpu_stall_state[1] ||
+                s->dport.appcpu_stall_state || !s->dport.appcpu_clkgate_state;
     }
 
     if (stall != s->cpu[n].env.runstall) {
         xtensa_runstall(&s->cpu[n].env, stall);
+        if (!stall && s->cpu_clock_saved_halted[n] &&
+            !s->cpu[n].env.pending_irq_level) {
+            s->cpu[n].parent_obj.halted = true;
+        }
+        if (!stall) {
+            s->cpu_clock_saved_halted[n] = false;
+        }
     }
 }
+
+static unsigned esp32_syscon_tick_index(Esp32SocState *s)
+{
+    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
+        return 1;
+    }
+    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_8M) {
+        return 2;
+    }
+    if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_APLL) {
+        return 3;
+    }
+    return 0;
+}
+
+static void esp32_update_uart_clocks(Esp32SocState *s)
+{
+    unsigned tick = esp32_syscon_tick_index(s);
+    uint64_t ref_den = s->apb_clock_den * (s->syscon_tick_num[tick] + 1);
+    for (unsigned i = 0; i < ESP32_UART_COUNT; i++) {
+        esp32_uart_set_clock_sources(&s->uart[i],
+            s->apb_clock_num, s->apb_clock_den,
+            s->apb_clock_num, ref_den);
+    }
+}
+
+static uint64_t esp32_syscon_read(void *opaque, hwaddr address,
+                                  unsigned size)
+{
+    Esp32SocState *s = opaque;
+    static const hwaddr offsets[] = { 0x04, 0x08, 0x0c, 0x3c };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++) {
+        if (address == offsets[i]) {
+            return s->syscon_tick_num[i] & 0xff;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "esp32.syscon: invalid read at 0x%" HWADDR_PRIx "\n",
+                  address);
+    return 0;
+}
+
+static void esp32_syscon_write(void *opaque, hwaddr address, uint64_t value,
+                               unsigned size)
+{
+    Esp32SocState *s = opaque;
+    static const hwaddr offsets[] = { 0x04, 0x08, 0x0c, 0x3c };
+
+    for (unsigned i = 0; i < ARRAY_SIZE(offsets); i++) {
+        if (address == offsets[i]) {
+            s->syscon_tick_num[i] = value & 0xff;
+            esp32_update_uart_clocks(s);
+            return;
+        }
+    }
+    qemu_log_mask(LOG_GUEST_ERROR, "esp32.syscon: invalid write at 0x%" HWADDR_PRIx "\n",
+                  address);
+}
+
+static const MemoryRegionOps esp32_syscon_ops = {
+    .read = esp32_syscon_read,
+    .write = esp32_syscon_write,
+    .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = { .min_access_size = 4, .max_access_size = 4,
+               .unaligned = false },
+    .impl = { .min_access_size = 4, .max_access_size = 4,
+              .unaligned = false },
+};
 
 static void esp32_clk_update(void* opaque, int n, int level)
 {
@@ -235,50 +317,86 @@ static void esp32_clk_update(void* opaque, int n, int level)
      * particular, an invalid CPU source must not retain a stale I2S APLL. */
     uint64_t apll_num = 0, apll_den = 1;
     esp32_rtc_get_apll_rate(&s->rtc_cntl, &apll_num, &apll_den);
+    esp32_gpio_set_apll_clkout(&s->gpio, apll_num, apll_den);
     for (unsigned i = 0; i < 2; i++) {
         esp32_i2s_set_apll_rate(&s->i2s[i], apll_num, apll_den);
     }
 
     /* APB clock */
-    uint32_t apb_clk_freq, cpu_clk_freq;
+    uint32_t apb_clk_freq = 0, cpu_clk_freq = 0;
+    uint64_t apb_num = 0, apb_den = 1;
+    bool clock_valid = true;
     if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_PLL) {
         const uint32_t cpu_clk_mul[] = {1, 2, 3};
         if (s->dport.cpuperiod_sel >= ARRAY_SIZE(cpu_clk_mul)) {
             qemu_log_mask(LOG_GUEST_ERROR, "esp32: reserved CPU PLL divider\n");
-            return;
+            clock_valid = false;
+        } else {
+            apb_clk_freq = s->rtc_cntl.pll_apb_freq;
+            cpu_clk_freq = cpu_clk_mul[s->dport.cpuperiod_sel] * apb_clk_freq;
+            apb_num = apb_clk_freq;
         }
-        apb_clk_freq = s->rtc_cntl.pll_apb_freq;
-        cpu_clk_freq = cpu_clk_mul[s->dport.cpuperiod_sel] * apb_clk_freq;
     } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_8M) {
         apb_clk_freq = cpu_clk_freq = 8000000;
+        apb_num = apb_clk_freq;
     } else if (s->rtc_cntl.soc_clk == ESP32_SOC_CLK_APLL) {
-        uint32_t apll = esp32_rtc_get_apll_hz(&s->rtc_cntl);
-        if (!apll) {
+        if (!apll_num || !apll_den) {
             qemu_log_mask(LOG_GUEST_ERROR,
                           "esp32: APLL CPU/APB selected but unavailable "
                           "(disabled or invalid coefficients)\n");
-            return;
-        }
-        unsigned div;
-        if (s->dport.cpuperiod_sel == 0) {
-            div = 4;
-        } else if (s->dport.cpuperiod_sel == 1) {
-            div = 2;
+            clock_valid = false;
         } else {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "esp32: reserved CPU APLL divider %u\n",
-                          s->dport.cpuperiod_sel);
-            return;
+            unsigned div;
+            if (s->dport.cpuperiod_sel == 0) {
+                div = 4;
+            } else if (s->dport.cpuperiod_sel == 1) {
+                div = 2;
+            } else {
+                qemu_log_mask(LOG_GUEST_ERROR,
+                              "esp32: reserved CPU APLL divider %u\n",
+                              s->dport.cpuperiod_sel);
+                div = 1;
+                clock_valid = false;
+            }
+            if (clock_valid) {
+                cpu_clk_freq = (apll_num / apll_den) / div;
+                apb_num = apll_num;
+                apb_den = apll_den * div * 2;
+                apb_clk_freq = apb_num / apb_den;
+            }
         }
-        cpu_clk_freq = apll / div;
-        apb_clk_freq = cpu_clk_freq / 2;
     } else {
         apb_clk_freq = s->rtc_cntl.xtal_apb_freq;
         cpu_clk_freq = apb_clk_freq;
+        apb_num = apb_clk_freq;
+    }
+    if (!clock_valid) {
+        /* An unavailable selected source stops CPU/APB consumers instead of
+         * leaving the rates from the previously selected source active. */
+        apb_clk_freq = cpu_clk_freq = 0;
+        apb_num = 0;
+        apb_den = 1;
+    }
+    s->apb_clock_num = apb_num;
+    s->apb_clock_den = apb_den;
+    esp32_update_uart_clocks(s);
+    if (!clock_valid && !s->cpu_clock_stall) {
+        for (unsigned i = 0; i < ESP32_CPU_COUNT; i++) {
+            s->cpu_clock_saved_halted[i] = s->cpu[i].parent_obj.halted &&
+                                           !s->cpu[i].env.runstall;
+        }
+    }
+    s->cpu_clock_stall = !clock_valid;
+    for (unsigned i = 0; i < ESP32_CPU_COUNT; i++) {
+        esp32_cpu_stall(s, i, 1);
     }
     qdev_prop_set_int32(DEVICE(&s->frc_timer), "apb_freq", apb_clk_freq);
     qdev_prop_set_int32(DEVICE(&s->timg[0]), "apb_freq", apb_clk_freq);
     qdev_prop_set_int32(DEVICE(&s->timg[1]), "apb_freq", apb_clk_freq);
+    for (unsigned i = 0; i < ESP32_TIMG_COUNT; i++) {
+        esp32_timg_set_rtc_clock_sources(&s->timg[i],
+            s->rtc_cntl.xtal_apb_freq, s->rtc_cntl.rtc_slowclk_freq);
+    }
     for (unsigned i = 0; i < ESP32_I2C_COUNT; i++) {
         esp32_i2c_set_apb_freq(&s->i2c[i], apb_clk_freq);
     }
@@ -337,6 +455,17 @@ static void esp32_soc_realize(DeviceState *dev, Error **errp)
 
     const struct MemmapEntry *memmap = esp32_memmap;
     MemoryRegion *sys_mem = get_system_memory();
+
+    memory_region_init_io(&s->syscon_mmio, OBJECT(s), &esp32_syscon_ops, s,
+                          "esp32.syscon", 0x40);
+    memory_region_add_subregion(sys_mem, DR_REG_SYSCON_BASE, &s->syscon_mmio);
+    MemoryRegion *syscon_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(syscon_apb, OBJECT(s), "esp32.syscon-apb",
+                             &s->syscon_mmio, 0,
+                             memory_region_size(&s->syscon_mmio));
+    memory_region_add_subregion_overlap(sys_mem,
+        DR_REG_SYSCON_BASE - DR_REG_DPORT_APB_BASE + APB_REG_BASE,
+        syscon_apb, 0);
 
     MemoryRegion *dram = g_new(MemoryRegion, 1);
     MemoryRegion *iram = g_new(MemoryRegion, 1);
