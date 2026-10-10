@@ -67,6 +67,8 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
         return s->perip_clk_en;
     case A_DPORT_PERIP_RST_EN:
         return s->perip_rst_en;
+    case A_DPORT_WIFI_CLK_EN:
+        return s->wifi_clk_en;
     case A_DPORT_APPCPU_RESET:
         r = s->appcpu_reset_state;
         break;
@@ -150,6 +152,10 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
         for (unsigned i = 0; i < 32; i++) {
             qemu_set_irq(s->perip_reset[i], (value >> i) & 1);
         }
+        break;
+    case A_DPORT_WIFI_CLK_EN:
+        /* The ESP32 register is a full-width R/W clock-enable bitmap. */
+        s->wifi_clk_en = value;
         break;
     case A_DPORT_APPCPU_RESET:
         old_state = s->appcpu_reset_state;
@@ -392,6 +398,7 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->cache_ill_trap_en_reg = 0;
     s->perip_clk_en = 0xf9c1e06f;
     s->perip_rst_en = 0;
+    s->wifi_clk_en = 0xfffce030;
     for (unsigned i = 0; i < 32; i++) {
         qemu_set_irq(s->perip_reset[i], 0);
         qemu_set_irq(s->perip_clock[i], (s->perip_clk_en >> i) & 1);
@@ -492,12 +499,13 @@ static int dport_peripherals_post_load(void *opaque, int version)
 
 static const VMStateDescription vmstate_dport_peripherals = {
     .name = "misc.esp32.dport/peripheral-clock",
-    .version_id = 1,
+    .version_id = 2,
     .minimum_version_id = 1,
     .post_load = dport_peripherals_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(perip_clk_en, Esp32DportState),
         VMSTATE_UINT32(perip_rst_en, Esp32DportState),
+        VMSTATE_UINT32_V(wifi_clk_en, Esp32DportState, 2),
         VMSTATE_END_OF_LIST()
     },
 };

@@ -76,6 +76,7 @@ typedef struct Esp32DportState {
     uint32_t slave_spi_config_reg;
     uint32_t perip_clk_en;
     uint32_t perip_rst_en;
+    uint32_t wifi_clk_en;
     qemu_irq perip_clock[32];
     qemu_irq perip_reset[32];
 
@@ -94,6 +95,9 @@ void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
 
 REG32(DPORT_PERIP_CLK_EN, 0xc0)
 REG32(DPORT_PERIP_RST_EN, 0xc4)
+
+/* ESP-IDF esp32 dport_reg.h: full-width R/W, reset value 0xfffce030. */
+REG32(DPORT_WIFI_CLK_EN, 0xcc)
 
 
 REG32(DPORT_APPCPU_RESET, 0x2c)

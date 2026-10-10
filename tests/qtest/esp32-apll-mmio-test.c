@@ -32,6 +32,12 @@
 #define GPIO 0x3ff44000
 #define MUX 0x3ff49000
 #define I2S 0x3ff4f000
+#define WIFI_CLK_EN 0x3ff000cc
+#define WIFI_CLK_COMMON 0x000003c9
+#define WIFI_CLK_WIFI 0x00000406
+#define WIFI_CLK_RNG (1u << 15)
+#define WIFI_CLK_BT (0x61u << 11)
+#define WIFI_PHY_REQUIRED 0x00008f8f
 
 static QTestState *start(const char *trace, bool rev1, char **efuse_name)
 {
@@ -336,6 +342,26 @@ static void test_bias_power(void)
     finish(q, efuse_name);
 }
 
+static void test_wifi_clock_enable_register(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    uint32_t value = qtest_readl(q, WIFI_CLK_EN);
+
+    /* ESP-IDF soc/esp32/register/soc/dport_reg.h documents this full-width
+     * R/W register's reset value and the masks used by phy_module_enable(). */
+    g_assert_cmphex(value, ==, 0xfffce030);
+    value |= WIFI_CLK_COMMON | WIFI_CLK_WIFI | WIFI_CLK_RNG | WIFI_CLK_BT;
+    qtest_writel(q, WIFI_CLK_EN, value);
+    g_assert_cmphex(qtest_readl(q, WIFI_CLK_EN), ==, value);
+    g_assert_cmphex(qtest_readl(q, WIFI_CLK_EN) & WIFI_PHY_REQUIRED, ==,
+                    WIFI_PHY_REQUIRED);
+    /* Writes are ordinary R/W, not sticky forced-enable bits. */
+    qtest_writel(q, WIFI_CLK_EN, value & ~WIFI_CLK_BT);
+    g_assert_cmphex(qtest_readl(q, WIFI_CLK_EN), ==, value & ~WIFI_CLK_BT);
+    finish(q, efuse_name);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -356,5 +382,7 @@ int main(int argc, char **argv)
     }
     qtest_add_func("/esp32/apll-mmio/reprogram-and-recover", test_reprogram_and_recover);
     qtest_add_func("/esp32/apll-mmio/bias-power", test_bias_power);
+    qtest_add_func("/esp32/apll-mmio/wifi-clock-enable",
+                   test_wifi_clock_enable_register);
     return g_test_run();
 }
