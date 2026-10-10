@@ -28,7 +28,13 @@ typedef struct Esp32I2SChannel {
     uint32_t phase;
     uint32_t clock_bit;
     uint64_t clock_remainder;
+    uint64_t analytic_frame_data;
+    uint64_t analytic_frame_ws;
+    uint64_t analytic_frame_remainder;
+    uint64_t analytic_frame_half_num;
+    uint64_t analytic_frame_half_den;
     int64_t deadline;
+    int64_t analytic_frame_origin;
     bool link_active;
     bool descriptor_loaded;
     bool clock_level;
@@ -39,6 +45,11 @@ typedef struct Esp32I2SChannel {
     bool synchronized;
     bool previous_ws;
     bool mono_pending;
+    bool analytic_clock;
+    bool analytic_frame_pending;
+    bool analytic_origin_falling;
+    bool analytic_paired;
+    uint8_t analytic_frame_count;
     int64_t paused_ns;
 } Esp32I2SChannel;
 
