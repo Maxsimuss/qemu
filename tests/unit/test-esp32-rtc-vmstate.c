@@ -51,6 +51,7 @@ static void initialize(Esp32RtcCntlState *s, bool fill)
     memset(s, 0, sizeof(*s));
     s->ana_i2c_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, timer_callback, NULL);
     s->apll_cal_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, timer_callback, NULL);
+    s->rfpll_cal_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL, timer_callback, NULL);
     if (!fill) {
         return;
     }
@@ -71,7 +72,7 @@ static void initialize(Esp32RtcCntlState *s, bool fill)
     s->reset_cause[0] = ESP32_SW_SYS_RESET;
     s->reset_cause[1] = ESP32_TGWDT_CPU_RESET;
     s->stat_vector_sel[1] = true;
-    s->ana_conf_reg = 1u << 24;
+    s->ana_conf_reg = (1u << 24) | (1u << 31);
     s->ana_config_reg = (0x3ffu << 8) & ~(1u << 14);
     s->apll_analog[0] = 0x3f;
     s->apll_analog[4] = 4;
@@ -87,14 +88,19 @@ static void initialize(Esp32RtcCntlState *s, bool fill)
     s->apll_cal_valid = true;
     s->apll_model_warned = true;
     s->apll_cal_deadline_ns = 20000;
+    s->rf_analog[0][0] = BIT(5);
+    s->rfpll_calibrating = true;
+    s->rfpll_cal_deadline_ns = 30000;
     timer_mod_ns(s->ana_i2c_timer, 10000);
     timer_mod_ns(s->apll_cal_timer, 20000);
+    timer_mod_ns(s->rfpll_cal_timer, 30000);
 }
 
 static void destroy(Esp32RtcCntlState *s)
 {
     timer_free(s->ana_i2c_timer);
     timer_free(s->apll_cal_timer);
+    timer_free(s->rfpll_cal_timer);
 }
 
 static int roundtrip_version(Esp32RtcCntlState *source, Esp32RtcCntlState *dest,
@@ -171,6 +177,9 @@ static void test_restore_pending(void)
     g_assert_true(dest.apll_calibrating);
     g_assert_true(dest.apll_cal_valid);
     g_assert_cmpint(dest.apll_cal_deadline_ns, ==, 20000);
+    g_assert_true(dest.rfpll_calibrating);
+    g_assert_cmpint(dest.rfpll_cal_deadline_ns, ==, 30000);
+    g_assert_cmpint(dest.rfpll_cal_timer->expire_time, ==, 30000);
     destroy(&source);
     callbacks = 0;
     virtual_time = 9999;
@@ -185,6 +194,12 @@ static void test_restore_pending(void)
     virtual_time = 20000;
     qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
     g_assert_cmpuint(callbacks, ==, 2);
+    virtual_time = 29999;
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    g_assert_cmpuint(callbacks, ==, 2);
+    virtual_time = 30000;
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    g_assert_cmpuint(callbacks, ==, 3);
     destroy(&dest);
     virtual_time = 0;
 }

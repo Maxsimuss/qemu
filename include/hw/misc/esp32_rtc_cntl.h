@@ -14,6 +14,7 @@
 #define ESP32_RTC_CPU_RESET_GPIO    "cpu-reset"
 #define ESP32_RTC_CPU_STALL_GPIO    "cpu-stall"
 #define ESP32_RTC_CLK_UPDATE_GPIO   "clk-update"
+#define ESP32_RTC_RFPLL_TUNE_GPIO   "rfpll-tune"
 
 typedef enum Esp32ResetCause {
     ESP32_POWERON_RESET = 1,
@@ -57,6 +58,7 @@ typedef struct Esp32RtcCntlState {
     MemoryRegion ana_i2c_iomem;
     QEMUTimer *ana_i2c_timer;
     QEMUTimer *apll_cal_timer;
+    QEMUTimer *rfpll_cal_timer;
     qemu_irq irq;
     qemu_irq dig_reset_req;
     qemu_irq cpu_reset_req[ESP32_CPU_COUNT];
@@ -85,6 +87,18 @@ typedef struct Esp32RtcCntlState {
     uint32_t ana_config_reg;
     uint32_t ana_i2c_cmd[8];
     uint32_t apll_analog[10];
+    uint32_t bbpll_analog[13];
+    uint8_t rf_analog[7][16];
+    uint16_t rf_analog_written[7];
+    bool rf_analog_unknown_reset_logged;
+    /* Retained as a VMState v4 compatibility field; no longer used. */
+    bool rf_analog_status_unimp_logged;
+    bool rfpll_calibrating;
+    bool rfpll_cal_armed;
+    bool rfpll_cal_start_low_seen;
+    bool rfpll_cal_start_high_seen;
+    uint8_t rfpll_tune_code;
+    int64_t rfpll_cal_deadline_ns;
     uint32_t ana_i2c_last_cmd;
     uint8_t ana_i2c_pending_host;
     bool ana_i2c_pending;

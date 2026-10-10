@@ -358,6 +358,10 @@ lasi_chip_write(uint64_t addr, uint32_t val) "addr 0x%"PRIx64" val 0x%08x"
 djmemc_read(int reg, uint64_t value, unsigned int size) "reg=0x%x value=0x%"PRIx64" size=%u"
 djmemc_write(int reg, uint64_t value, unsigned int size) "reg=0x%x value=0x%"PRIx64" size=%u"
 
+# esp32_rtc_cntl.c
+esp32_ana_i2c_command(unsigned int host, uint32_t command, unsigned int block, unsigned int reg, unsigned int data, bool write, bool enabled) "host=%u cmd=0x%08x block=0x%02x reg=0x%02x data=0x%02x write=%u enabled=%u"
+esp32_rfpll_calibration(uint32_t phase, uint32_t tune, uint32_t measurement_ns, uint32_t reserved, uint32_t ana_conf, uint32_t options0) "phase=%u tune=%u measurement=%u ns reserved=%u ana_conf=0x%08x options0=0x%08x"
+
 # iosb.c
 iosb_read(int reg, uint64_t value, unsigned int size) "reg=0x%x value=0x%"PRIx64" size=%u"
 iosb_write(int reg, uint64_t value, unsigned int size) "reg=0x%x value=0x%"PRIx64" size=%u"
@@ -367,4 +371,3 @@ aspeed_sli_write(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRI
 aspeed_sli_read(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
 aspeed_sliio_write(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
 aspeed_sliio_read(uint64_t offset, unsigned int size, uint32_t data) "To 0x%" PRIx64 " of size %u: 0x%" PRIx32
-
