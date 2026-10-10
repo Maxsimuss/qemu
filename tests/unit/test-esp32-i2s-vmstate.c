@@ -99,6 +99,17 @@ static void initialize(Esp32I2SState *s, bool fill)
         c->clock_bit = 22;
         c->clock_remainder = 5;
         c->deadline = 10000;
+        c->analytic_clock = direction;
+        c->analytic_frame_pending = direction;
+        c->analytic_origin_falling = direction;
+        c->analytic_paired = direction;
+        c->analytic_frame_data = 0x0123456789abcdef;
+        c->analytic_frame_ws = 0x55aa55aa55aa55aa;
+        c->analytic_frame_remainder = 7;
+        c->analytic_frame_half_num = 625;
+        c->analytic_frame_half_den = 3;
+        c->analytic_frame_origin = 9987;
+        c->analytic_frame_count = direction ? 64 : 0;
         c->link_active = c->descriptor_loaded = true;
         c->ws_level = c->data_level = c->frame_valid = true;
         c->started = c->synchronized = c->mono_pending = true;
@@ -194,6 +205,7 @@ static void test_restore(void)
                     dest.input_level, sizeof(dest.input_level));
     compare_channel(&source.tx, &dest.tx);
     compare_channel(&source.rx, &dest.rx);
+    g_assert_true(dest.rx.analytic_paired);
     g_assert_cmpuint(dest.mclk_remainder, ==, 7);
     g_assert_cmpint(dest.mclk_deadline, ==, 1000);
     g_assert_cmpint(dest.mclk_paused_ns, ==, 25);
@@ -221,6 +233,12 @@ static void test_restore(void)
     virtual_time = 12345;
     qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
     g_assert_cmpuint(callbacks, ==, 1);
+    virtual_time = 23455;
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    g_assert_cmpuint(callbacks, ==, 1);
+    virtual_time = 23456;
+    qemu_clock_run_timers(QEMU_CLOCK_VIRTUAL);
+    g_assert_cmpuint(callbacks, ==, 2);
     destroy(&dest);
 }
 

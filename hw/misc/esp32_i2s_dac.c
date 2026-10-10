@@ -496,6 +496,56 @@ static void bclk_rise(Esp32I2SDac *s, int64_t now)
     }
 }
 
+static uint64_t serial_half_step(uint64_t *phase, uint64_t numerator,
+                                 uint64_t denominator)
+{
+    if (numerator <= UINT64_MAX - *phase) {
+        uint64_t accumulated = *phase + numerator;
+        uint64_t ns = accumulated / denominator;
+        *phase = accumulated % denominator;
+        return ns;
+    }
+    __uint128_t accumulated = (__uint128_t)*phase + numerator;
+    uint64_t ns = accumulated / denominator;
+    *phase = accumulated % denominator;
+    return ns;
+}
+
+static void serial_frame(void *opaque, uint64_t data_bits, uint64_t ws_bits,
+                         unsigned bit_count, int64_t first_rising_ns,
+                         uint64_t half_num, uint64_t half_den,
+                         uint64_t remainder, bool bclk_inverted)
+{
+    Esp32I2SDac *s = opaque;
+    uint64_t phase = remainder;
+    int64_t now = first_rising_ns;
+    uint64_t before_phase = phase;
+    int64_t ws_falling = now - serial_half_step(&before_phase, half_num,
+                                                 half_den);
+
+    if (bclk_inverted) {
+        now += serial_half_step(&phase, half_num, half_den);
+    }
+    for (unsigned i = 0; i < bit_count; i++) {
+        bool ws = (ws_bits >> i) & 1;
+        bool data = (data_bits >> i) & 1;
+        bool old_ws = s->level[PIN_WS] == ESP32_PAD_HIGH;
+        s->level[PIN_WS] = ws ? ESP32_PAD_HIGH : ESP32_PAD_LOW;
+        s->level[PIN_DATA] = data ? ESP32_PAD_HIGH : ESP32_PAD_LOW;
+        if (old_ws && !ws) {
+            ws_fell(s, bclk_inverted ? now : ws_falling);
+        }
+        s->level[PIN_BCLK] = ESP32_PAD_HIGH;
+        s->bclk_rises++;
+        bclk_rise(s, now);
+        uint64_t first_ns = serial_half_step(&phase, half_num, half_den);
+        uint64_t second_ns = serial_half_step(&phase, half_num, half_den);
+        ws_falling = now + first_ns;
+        now += first_ns + second_ns;
+    }
+    s->level[PIN_BCLK] = bclk_inverted ? ESP32_PAD_HIGH : ESP32_PAD_LOW;
+}
+
 static void pad_event(void *opaque, int n, int value)
 {
     Esp32I2SDac *s = opaque;
@@ -795,8 +845,16 @@ static void dac_realize(DeviceState *dev, Error **errp)
     dac_reset(dev);
     /* Registering listeners replays the present level of each pad. */
     for (unsigned i = 0; i < PIN_COUNT; i++) {
-        esp32_gpio_add_pad_listener(s->gpio, s->pad[i], s->sink[i]);
+        if (i == PIN_BCLK || i == PIN_WS || i == PIN_DATA) {
+            esp32_gpio_add_analytic_pad_listener(s->gpio, s->pad[i],
+                                                 s->sink[i]);
+        } else {
+            esp32_gpio_add_pad_listener(s->gpio, s->pad[i], s->sink[i]);
+        }
     }
+    esp32_gpio_add_serial_frame_observer(s->gpio, s->pad[PIN_BCLK],
+                                         s->pad[PIN_WS], s->pad[PIN_DATA],
+                                         serial_frame, s);
     /* Leave a valid, empty WAV behind when nothing is recorded. */
     if (s->wav) {
         wav_open(s);
@@ -810,6 +868,7 @@ static void dac_unrealize(DeviceState *dev)
 
     record_stop(s);
     qemu_remove_exit_notifier(&s->exit_notifier);
+    esp32_gpio_remove_serial_frame_observer(s->gpio, serial_frame, s);
     for (unsigned i = 0; i < PIN_COUNT; i++) {
         esp32_gpio_remove_pad_listener(s->gpio, s->pad[i], s->sink[i]);
         qemu_free_irq(s->sink[i]);

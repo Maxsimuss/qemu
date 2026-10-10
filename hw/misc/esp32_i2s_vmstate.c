@@ -108,7 +108,7 @@ int esp32_i2s_post_load(void *opaque, int version)
 }
 
 static const VMStateDescription vmstate_channel = {
-    .name = "esp32.i2s/channel", .version_id = 1, .minimum_version_id = 1,
+    .name = "esp32.i2s/channel", .version_id = 3, .minimum_version_id = 1,
     .fields = (const VMStateField[]) {
         VMSTATE_TIMER_PTR(timer, Esp32I2SChannel),
         VMSTATE_UINT32_ARRAY(fifo, Esp32I2SChannel, 64),
@@ -129,6 +129,13 @@ static const VMStateDescription vmstate_channel = {
         VMSTATE_UINT32(clock_bit, Esp32I2SChannel),
         VMSTATE_UINT64(clock_remainder, Esp32I2SChannel),
         VMSTATE_INT64(deadline, Esp32I2SChannel),
+        VMSTATE_UINT64_V(analytic_frame_data, Esp32I2SChannel, 2),
+        VMSTATE_UINT64_V(analytic_frame_ws, Esp32I2SChannel, 2),
+        VMSTATE_UINT64_V(analytic_frame_remainder, Esp32I2SChannel, 2),
+        VMSTATE_UINT64_V(analytic_frame_half_num, Esp32I2SChannel, 2),
+        VMSTATE_UINT64_V(analytic_frame_half_den, Esp32I2SChannel, 2),
+        VMSTATE_INT64_V(analytic_frame_origin, Esp32I2SChannel, 2),
+        VMSTATE_UINT8_V(analytic_frame_count, Esp32I2SChannel, 2),
         VMSTATE_BOOL(link_active, Esp32I2SChannel),
         VMSTATE_BOOL(descriptor_loaded, Esp32I2SChannel),
         VMSTATE_BOOL(clock_level, Esp32I2SChannel),
@@ -139,13 +146,17 @@ static const VMStateDescription vmstate_channel = {
         VMSTATE_BOOL(synchronized, Esp32I2SChannel),
         VMSTATE_BOOL(previous_ws, Esp32I2SChannel),
         VMSTATE_BOOL(mono_pending, Esp32I2SChannel),
+        VMSTATE_BOOL_V(analytic_clock, Esp32I2SChannel, 2),
+        VMSTATE_BOOL_V(analytic_frame_pending, Esp32I2SChannel, 2),
+        VMSTATE_BOOL_V(analytic_origin_falling, Esp32I2SChannel, 2),
+        VMSTATE_BOOL_V(analytic_paired, Esp32I2SChannel, 3),
         VMSTATE_INT64(paused_ns, Esp32I2SChannel),
         VMSTATE_END_OF_LIST()
     },
 };
 
 const VMStateDescription vmstate_esp32_i2s = {
-    .name = TYPE_ESP32_I2S, .version_id = 2, .minimum_version_id = 1,
+    .name = TYPE_ESP32_I2S, .version_id = 3, .minimum_version_id = 1,
     .post_load = esp32_i2s_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32I2SState, 64),

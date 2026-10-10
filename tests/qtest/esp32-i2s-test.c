@@ -241,16 +241,100 @@ static void cross_controller(void)
     qtest_quit(tx.q);
 }
 
+static void duplex_run(unsigned port, const char *extra, unsigned pad_mode)
+{
+    TestBus b = setup(port, true, extra);
+    unsigned rx_bck = port ? 164 : 27;
+    unsigned rx_ws = port ? 165 : 28;
+    unsigned din = port ? 181 : 155;
+    unsigned dout = port ? 189 : 163;
+
+    /* Route master clocks through physical pads; keep DIN separate from DOUT. */
+    qtest_writel(b.q, GPIO + 0x130 + rx_bck * 4, CLK | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_ws * 4, WS | 128);
+    qtest_writel(b.q, GPIO + 0x130 + din * 4, SD | 128);
+    qtest_writel(b.q, MUX + 0x90, (2 << 12) | (1 << 9));
+    qtest_writel(b.q, GPIO + 0x530 + SD * 4, 256);
+    qtest_writel(b.q, GPIO + 0x530 + 24 * 4, dout);
+    if (pad_mode == 1) {
+        /* Open-drain clock pads release their high phase without a pull-up. */
+        qtest_writel(b.q, GPIO + 0x88 + CLK * 4, 1 << 2);
+        qtest_writel(b.q, GPIO + 0x88 + WS * 4, 1 << 2);
+    } else if (pad_mode == 2) {
+        /* Register OE is disabled: the logical clock cannot drive these pads. */
+        qtest_writel(b.q, GPIO + 0x530 + CLK * 4,
+                     (port ? 24 : 23) | (1 << 10));
+        qtest_writel(b.q, GPIO + 0x530 + WS * 4,
+                     (port ? 26 : 25) | (1 << 10));
+    }
+    write_reg(&b, 0xb0, 8 | (8 << 6) | (32 << 12) | (32 << 18));
+
+    qtest_writel(b.q, DESC, (1u << 31) | 8);
+    qtest_writel(b.q, DESC + 4, DATA);
+    qtest_writel(b.q, DESC + 8, 0);
+    write_reg(&b, 0x24, 2);
+    write_reg(&b, 0x34, (DESC & 0xfffff) | (1 << 29));
+    write_reg(&b, 0x20, read_reg(&b, 0x20) | (2 << 16));
+    write_reg(&b, 0x20, read_reg(&b, 0x20) | (1 << 12));
+    write_reg(&b, 0x00, 0x0123abcd);
+    write_reg(&b, 0x08, (1 << 4) | (1 << 5) | (1 << 18));
+    /* The 64th rising sample edge arrives at 31,750 ns. */
+    if (pad_mode) {
+        qtest_clock_step(b.q, 250);
+        g_assert_false(pin(&b, CLK));
+    }
+    qtest_clock_step(b.q, pad_mode ? 31499 : 31749);
+    g_assert_cmphex(qtest_readl(b.q, DESC) & (1u << 31), ==, 1u << 31);
+    qtest_clock_step(b.q, 1);
+    g_assert_cmphex(qtest_readl(b.q, DATA), ==, 0);
+    g_assert_cmphex(qtest_readl(b.q, DATA + 4), ==, 0);
+    g_assert_cmphex(qtest_readl(b.q, DESC) & (1u << 31), ==, 0);
+    g_assert_cmphex(read_reg(&b, 0x0c) & (1 << 9), ==, 1 << 9);
+    /* DIN is held low on GPIO23 while DOUT uses GPIO24. */
+    g_assert_false(pin(&b, SD));
+    qtest_quit(b.q);
+}
+
 static void duplex(gconstpointer data)
 {
+    duplex_run(GPOINTER_TO_UINT(data), NULL, 0);
+}
+
+static void duplex_unresolved_pad(gconstpointer data)
+{
+    unsigned port = GPOINTER_TO_UINT(data) & 1;
+    unsigned pad_mode = GPOINTER_TO_UINT(data) >> 1;
+
+    duplex_run(port, NULL, pad_mode);
+}
+
+static void duplex_trace(gconstpointer data)
+{
     unsigned port = GPOINTER_TO_UINT(data);
-    TestBus b = setup(port, true, NULL);
-    qtest_writel(b.q, GPIO + 0x130 + (port ? 181 : 155) * 4, SD | 128);
-    write_reg(&b, 0x00, 0x0123abcd);
-    write_reg(&b, 0x08, (1 << 4) | (1 << 5) | (1 << 7) | (1 << 18));
-    check_frame(&b, 0x0123abcd, false);
-    g_assert_cmphex(read_reg(&b, 0x04), ==, 0x0123abcd);
-    qtest_quit(b.q);
+    g_autofree char *name = NULL;
+    g_autofree char *text = NULL;
+    int fd = g_file_open_tmp("esp32-duplex-XXXXXX.vcd", &name, NULL);
+    g_assert_cmpint(fd, >=, 0);
+    close(fd);
+    g_autofree char *args = g_strdup_printf(
+        "-global driver=esp32.gpio,property=pin-trace,value=%s", name);
+
+    duplex_run(port, args, 0);
+    g_assert_true(g_file_get_contents(name, &text, NULL, NULL));
+    g_auto(GStrv) lines = g_strsplit(text, "\n", -1);
+    int64_t now = 0, previous = -1;
+    unsigned edges = 0;
+    for (unsigned i = 0; lines[i]; i++) {
+        if (lines[i][0] == '#') {
+            now = g_ascii_strtoll(lines[i] + 1, NULL, 10);
+        } else if (strlen(lines[i]) == 4 && !strcmp(lines[i] + 1, "P18")) {
+            g_assert_cmpint(now, >=, previous);
+            previous = now;
+            edges++;
+        }
+    }
+    g_assert_cmpuint(edges, >, 100);
+    unlink(name);
 }
 
 static void clock_gate_and_stop(gconstpointer data)
@@ -261,7 +345,7 @@ static void clock_gate_and_stop(gconstpointer data)
     write_reg(&b, 0x00, 0xa55ac33c);
     write_reg(&b, 0xa0, 0x189);
     write_reg(&b, 0x08, 1 << 4);
-    qtest_clock_step(b.q, 100);
+    qtest_clock_step(b.q, 600); /* Pause after analytic edges have begun. */
     qtest_writel(b.q, DPORT + 0xc0, 0);
     qtest_clock_step(b.q, 10000);
     g_assert_false(pin(&b, CLK));
@@ -465,6 +549,29 @@ static void mclk_trace(gconstpointer data)
     unlink(name);
 }
 
+static void mclk_lazy_read(gconstpointer data)
+{
+    unsigned port = GPOINTER_TO_UINT(data);
+    TestBus b = setup(port, true, NULL);
+
+    qtest_writel(b.q, MUX, port ? 15 : 0);
+    qtest_writel(b.q, MUX + 0x44, (1 << 12) | (1 << 9));
+    g_assert_false(pin(&b, 0));
+    qtest_clock_step(b.q, 30);
+    g_assert_false(pin(&b, 0));
+    qtest_clock_step(b.q, 1);
+    g_assert_true(pin(&b, 0));
+    qtest_clock_step(b.q, 31);
+    g_assert_false(pin(&b, 0));
+    qtest_clock_step(b.q, 31);
+    g_assert_true(pin(&b, 0));
+    qtest_clock_step(b.q, 31);
+    g_assert_true(pin(&b, 0));
+    qtest_clock_step(b.q, 1);
+    g_assert_false(pin(&b, 0));
+    qtest_quit(b.q);
+}
+
 static void dma_chain(gconstpointer data)
 {
     TestBus b = setup(GPOINTER_TO_UINT(data), true, NULL);
@@ -619,6 +726,39 @@ static void receive_master(gconstpointer data)
     qtest_quit(b.q);
 }
 
+/*
+ * In analytic mode RX retires the frame at its final sample edge, keeping
+ * DMA ownership and EOF timing aligned with the bit-clock waveform.
+ */
+static void rx_analytic_dma_boundary(gconstpointer data)
+{
+    TestBus b = setup(GPOINTER_TO_UINT(data), false, NULL);
+
+    qtest_writel(b.q, DESC, (1u << 31) | (1u << 30) | (4 << 12) | 4);
+    qtest_writel(b.q, DESC + 4, DATA);
+    qtest_writel(b.q, DESC + 8, 0);
+    write_reg(&b, 0x24, 1);
+    write_reg(&b, 0x20, read_reg(&b, 0x20) | (1 << 12));
+    write_reg(&b, 0x34, (DESC & 0xfffff) | (1 << 29));
+    write_reg(&b, 0x08, 1 << 5);
+
+    /*
+     * 32-bit stereo at 16 MHz / 8 gives 250 ns per half-cycle. The first
+     * rising edge is at 250 ns; the frame's final sample edge is 15,750 ns.
+     */
+    qtest_clock_step(b.q, 15500);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==,
+                    (1u << 31) | (1u << 30) | (4 << 12) | 4);
+    g_assert_cmphex(read_reg(&b, 0x0c) & (1 << 9), ==, 0);
+    qtest_clock_step(b.q, 250);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==,
+                    (1u << 30) | (4 << 12) | 4);
+    g_assert_cmphex(read_reg(&b, 0x0c) & (1 << 9), ==, 1 << 9);
+    g_assert_cmphex(qtest_readl(b.q, DATA), ==, 0);
+    g_assert_cmphex(qtest_readl(b.q, DATA + 4), ==, 0);
+    qtest_quit(b.q);
+}
+
 static void channel_selection(gconstpointer data)
 {
     TestBus b = setup(GPOINTER_TO_UINT(data), true, NULL);
@@ -717,9 +857,21 @@ int main(int argc, char **argv)
         g_test_add_data_func(rxdma, GUINT_TO_POINTER(port), dma_rx);
         g_autofree char *slave = g_strdup_printf("/esp32/i2s%u/tx-slave", port);
         g_autofree char *duplex_name = g_strdup_printf("/esp32/i2s%u/full-duplex", port);
+        g_autofree char *duplex_trace_name = g_strdup_printf(
+            "/esp32/i2s%u/full-duplex-trace", port);
+        g_autofree char *duplex_od_name = g_strdup_printf(
+            "/esp32/i2s%u/full-duplex-open-drain", port);
+        g_autofree char *duplex_oe_name = g_strdup_printf(
+            "/esp32/i2s%u/full-duplex-register-oe", port);
         g_autofree char *gate = g_strdup_printf("/esp32/i2s%u/clock-gate-stop-resume", port);
         g_test_add_data_func(slave, GUINT_TO_POINTER(port), tx_slave);
         g_test_add_data_func(duplex_name, GUINT_TO_POINTER(port), duplex);
+        g_test_add_data_func(duplex_trace_name, GUINT_TO_POINTER(port),
+                             duplex_trace);
+        g_test_add_data_func(duplex_od_name, GUINT_TO_POINTER((1 << 1) | port),
+                             duplex_unresolved_pad);
+        g_test_add_data_func(duplex_oe_name, GUINT_TO_POINTER((2 << 1) | port),
+                             duplex_unresolved_pad);
         g_test_add_data_func(gate, GUINT_TO_POINTER(port), clock_gate_and_stop);
         g_autofree char *camera_name = g_strdup_printf("/esp32/i2s%u/camera", port);
         g_autofree char *lcd1 = g_strdup_printf("/esp32/i2s%u/lcd-form1", port);
@@ -734,9 +886,12 @@ int main(int argc, char **argv)
         g_autofree char *mono_name = g_strdup_printf("/esp32/i2s%u/mono-fifo-packing", port);
         g_autofree char *decompress = g_strdup_printf("/esp32/i2s%u/pcm-decompress", port);
         g_autofree char *mclk = g_strdup_printf("/esp32/i2s%u/mclk-physical-vcd", port);
+        g_autofree char *mclk_lazy = g_strdup_printf(
+            "/esp32/i2s%u/mclk-lazy-level", port);
         g_test_add_data_func(mono_name, GUINT_TO_POINTER(port), mono_packing);
         g_test_add_data_func(decompress, GUINT_TO_POINTER(port), pcm_decompress);
         g_test_add_data_func(mclk, GUINT_TO_POINTER(port), mclk_trace);
+        g_test_add_data_func(mclk_lazy, GUINT_TO_POINTER(port), mclk_lazy_read);
         g_autofree char *chain = g_strdup_printf("/esp32/i2s%u/dma-chain-eof", port);
         g_autofree char *rxchain = g_strdup_printf("/esp32/i2s%u/rx-dma-chain", port);
         g_autofree char *errors = g_strdup_printf("/esp32/i2s%u/dma-errors", port);
@@ -748,8 +903,12 @@ int main(int argc, char **argv)
         g_test_add_data_func(bounds, GUINT_TO_POINTER(port), fifo_bounds);
         g_test_add_data_func(fractional, GUINT_TO_POINTER(port), fractional_clock);
         g_autofree char *master = g_strdup_printf("/esp32/i2s%u/rx-master", port);
+        g_autofree char *rxboundary = g_strdup_printf(
+            "/esp32/i2s%u/rx-analytic-dma-boundary", port);
         g_autofree char *channels = g_strdup_printf("/esp32/i2s%u/channel-selection", port);
         g_test_add_data_func(master, GUINT_TO_POINTER(port), receive_master);
+        g_test_add_data_func(rxboundary, GUINT_TO_POINTER(port),
+                             rx_analytic_dma_boundary);
         g_test_add_data_func(channels, GUINT_TO_POINTER(port), channel_selection);
         g_autofree char *unmodeled = g_strdup_printf("/esp32/i2s%u/unmodeled-is-unknown", port);
         g_test_add_data_func(unmodeled, GUINT_TO_POINTER(port), unsupported_mode);

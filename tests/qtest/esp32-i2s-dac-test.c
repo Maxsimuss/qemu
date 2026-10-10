@@ -19,6 +19,8 @@
 #define I2S0 0x3ff4f000
 #define DESC 0x3ffb0000
 #define DATA_BUF 0x3ffb0100
+#define RX_DESC (DESC + 0x20)
+#define RX_DATA (DATA_BUF + 0x2000)
 
 #define PAD_SDA 21
 #define PAD_SCL 22
@@ -700,9 +702,21 @@ static void i2s_write(QTestState *q, unsigned offset, uint32_t value)
  * Fs = 16.03 kHz (0.16% from 16 kHz). MCLK is not routed: the DAC measures
  * the frame rate from WS edges and the BCLK count per frame.
  */
-static void real_i2s(void)
+static void real_i2s_run(bool trace)
 {
-    Dut d = dut_start(NULL, NULL);
+    g_autofree char *trace_path = NULL;
+    g_autofree char *machine_args = NULL;
+    if (trace) {
+        int fd = g_file_open_tmp("esp32-i2s-trace-XXXXXX.vcd", &trace_path,
+                                 NULL);
+        g_assert_cmpint(fd, >=, 0);
+        close(fd);
+        unlink(trace_path);
+        machine_args = g_strdup_printf(
+            "-global driver=esp32.gpio,property=pin-trace,value=%s",
+            trace_path);
+    }
+    Dut d = dut_start(NULL, machine_args);
     QTestState *q = d.q;
     enum { N = 24, M = 4 };
     Wav w;
@@ -753,6 +767,162 @@ static void real_i2s(void)
         g_assert_cmphex(wav_sample(&w, i, 0), ==, pattern(i, 0, 16));
         g_assert_cmphex(wav_sample(&w, i, 1), ==, pattern(i, 1, 16));
     }
+    wav_free(&w);
+    dut_end(&d);
+
+    if (trace) {
+        gchar *vcd;
+        gsize length;
+        unsigned bclk_transitions = 0;
+        g_assert_true(g_file_get_contents(trace_path, &vcd, &length, NULL));
+        g_assert_cmpuint(length, >, 1024);
+        g_assert_nonnull(strstr(vcd, "$timescale"));
+        g_assert_nonnull(strstr(vcd, "#"));
+        for (char *line = vcd; line && *line;) {
+            char *end = strchr(line, '\n');
+            if (end && end - line >= 4 && line[1] == 'P' &&
+                line[2] == '1' && line[3] == '8' &&
+                (line[0] == '0' || line[0] == '1')) {
+                bclk_transitions++;
+            }
+            line = end ? end + 1 : NULL;
+        }
+        /*
+         * 28 stereo frames carry 1,792 BCLK transitions; allow startup and
+         * stop phase details while still proving the complete traced stream.
+         */
+        g_assert_cmpuint(bclk_transitions, >=, 1700);
+        g_free(vcd);
+        unlink(trace_path);
+    }
+}
+
+static void real_i2s(void)
+{
+    real_i2s_run(false);
+}
+
+static void real_i2s_trace(void)
+{
+    /*
+     * With full pad tracing enabled, the same physical DAC switches to the
+     * timestamped edge path and must capture the identical DMA sample stream.
+     */
+    real_i2s_run(true);
+}
+
+static void real_i2s_wrong_physical_route(void)
+{
+    Dut d = dut_start(NULL, NULL);
+    QTestState *q = d.q;
+
+    qtest_writel(q, DPORT + 0xc0, (1 << 4) | (1 << 21));
+    qtest_writel(q, MUX + 0x44, (2 << 12) | (1 << 9)); /* GPIO5 */
+    qtest_writel(q, MUX + 0x74, (2 << 12) | (1 << 9)); /* GPIO19 */
+    qtest_writel(q, MUX + 0x8c, (2 << 12) | (1 << 9)); /* GPIO23 */
+    qtest_writel(q, GPIO + 0x530 + 5 * 4, 23); /* BCLK is misrouted. */
+    qtest_writel(q, GPIO + 0x530 + PAD_WS * 4, 25);
+    qtest_writel(q, GPIO + 0x530 + PAD_DATA * 4, 163);
+    i2s_write(q, 0xac, (1 << 20) | 39);
+    i2s_write(q, 0xb0, 8 | (8 << 6) | (16 << 12) | (16 << 18));
+    i2s_write(q, 0x20, 32 | (32 << 6) | (1 << 19) | (1 << 20));
+    configure(q, 2, 16, 1);
+    dac_set(q, REG_RECORD, 1);
+    i2s_write(q, 0x00, 0x12345678);
+    i2s_write(q, 0x08, (1 << 4) | (1 << 10));
+    qtest_clock_step(q, 2000000);
+    g_assert_cmpuint(dac_frames(q), ==, 0);
+    dac_set(q, REG_RECORD, 0);
+    dut_end(&d);
+}
+
+/*
+ * One virtual second of 48 kHz, 32-bit stereo TX through the physical GPIO
+ * matrix into both TAS observers and the recording DAC.  The DMA burst is
+ * intentionally finite; after its EOF the real I2S underrun rule replays the
+ * last frame, giving the WAV a simple golden tail.
+ */
+static void analytic_audio_second(void)
+{
+    g_autofree char *devices = g_strdup(
+        "-device esp32-tas5828m,gpio=/machine/soc/gpio,address=0x61,"
+        "driver-slot=2,bclk=18,ws=19,data=23 "
+        "-device esp32-tas5830,gpio=/machine/soc/gpio,address=0x62,"
+        "driver-slot=3");
+    Dut d = dut_start(NULL, devices);
+    QTestState *q = d.q;
+    const unsigned burst_frames = 511;
+    Wav w;
+    int64_t start_us, elapsed_us;
+    unsigned frames;
+
+    qtest_writel(q, DPORT + 0xc0, (1 << 4) | (1 << 21));
+    qtest_writel(q, MUX + 0x70, (2 << 12) | (1 << 9));
+    qtest_writel(q, MUX + 0x74, (2 << 12) | (1 << 9));
+    qtest_writel(q, MUX + 0x8c, (2 << 12) | (1 << 9));
+    qtest_writel(q, GPIO + 0x530 + PAD_BCLK * 4, 23);
+    qtest_writel(q, GPIO + 0x530 + PAD_WS * 4, 25);
+    qtest_writel(q, GPIO + 0x530 + PAD_DATA * 4, 163);
+    /* RX clocks come from the routed TX pads; DIN is independent and low. */
+    qtest_writel(q, GPIO + 0x130 + 27 * 4, PAD_BCLK | 128);
+    qtest_writel(q, GPIO + 0x130 + 28 * 4, PAD_WS | 128);
+    qtest_writel(q, GPIO + 0x130 + 155 * 4, 16 | 128);
+    i2s_write(q, 0xac, (1 << 20) | 6 | (2 << 14) | (1 << 8));
+    i2s_write(q, 0xb0, 8 | (8 << 6) | (32 << 12) | (32 << 18));
+    i2s_write(q, 0x20, (2 << 13) | (2 << 16) | (1 << 19) | (1 << 20));
+    i2s_write(q, 0x08, 0);
+
+    configure(q, 2, 32, 3);
+    dac_set(q, REG_RECORD, 1);
+    qtest_writel(q, DESC, (1u << 31) | (1u << 30) |
+                 (4088u << 12) | 4092u);
+    qtest_writel(q, DESC + 4, DATA_BUF);
+    qtest_writel(q, DESC + 8, 0);
+    qtest_writel(q, RX_DESC, (1u << 31) | 512);
+    qtest_writel(q, RX_DESC + 4, RX_DATA);
+    qtest_writel(q, RX_DESC + 8, RX_DESC);
+    qtest_writel(q, RX_DATA, 0xa5a5a5a5);
+    qtest_writel(q, RX_DATA + 508, 0xa5a5a5a5);
+    for (unsigned i = 0; i < burst_frames; i++) {
+        qtest_writel(q, DATA_BUF + 8 * i, pattern(i, 0, 32));
+        qtest_writel(q, DATA_BUF + 8 * i + 4, pattern(i, 1, 32));
+    }
+    i2s_write(q, 0xa0, 0x89); /* Repeat the final sample on underrun. */
+    i2s_write(q, 0x60, (1 << 12) | (1 << 8) | (1 << 6));
+    i2s_write(q, 0x20, qtest_readl(q, I2S0 + 0x20) | (1 << 12));
+    i2s_write(q, 0x24, 128);
+    i2s_write(q, 0x30, (DESC & 0xfffff) | (1 << 29));
+    i2s_write(q, 0x34, (RX_DESC & 0xfffff) | (1 << 29));
+    i2s_write(q, 0x08, (1 << 4) | (1 << 5) | (1 << 10) | (1 << 18));
+
+    start_us = g_get_monotonic_time();
+    qtest_clock_step(q, 1000000000);
+    elapsed_us = g_get_monotonic_time() - start_us;
+    g_assert_cmpuint(dac_get(q, REG_STATUS), ==, ST_RECORDING);
+    g_assert_cmphex(qtest_readl(q, I2S0 + 0x0c) & (1 << 9), ==, 1 << 9);
+    g_assert_cmphex(qtest_readl(q, RX_DATA), ==, 0);
+    g_assert_cmphex(qtest_readl(q, RX_DATA + 508), ==, 0);
+    dac_set(q, REG_RECORD, 0);
+    g_assert_cmpuint(dac_get(q, REG_STATUS), ==, 0);
+    frames = dac_frames(q);
+    g_assert_cmpuint(frames, >=, 47000);
+    g_assert_cmpuint(frames, <=, 49000);
+    w = wav_load(d.wav);
+    g_assert_cmpuint(w.depth, ==, 32);
+    g_assert_cmpuint(w.rate, ==, 48000);
+    for (unsigned i = 0; i < burst_frames; i++) {
+        g_assert_cmphex(wav_sample(&w, i, 0), ==, pattern(i, 0, 32));
+        g_assert_cmphex(wav_sample(&w, i, 1), ==, pattern(i, 1, 32));
+    }
+    for (unsigned i = burst_frames; i < frames; i++) {
+        g_assert_cmphex(wav_sample(&w, i, 0), ==,
+                        pattern(burst_frames - 1, 0, 32));
+        g_assert_cmphex(wav_sample(&w, i, 1), ==,
+                        pattern(burst_frames - 1, 1, 32));
+    }
+    g_test_message("ANALYTIC_AUDIO_BENCH sim_ns=1000000000 host_us=%" PRId64
+                   " speed_x=%.3f frames=%u",
+                   elapsed_us, 1000000.0 / elapsed_us, dac_frames(q));
     wav_free(&w);
     dut_end(&d);
 }
@@ -815,6 +985,11 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/i2s-dac/odd-chunk", odd_chunk);
     qtest_add_func("/esp32/i2s-dac/size-limit", size_limit);
     qtest_add_func("/esp32/i2s-dac/real-i2s0", real_i2s);
+    qtest_add_func("/esp32/i2s-dac/real-i2s0-trace", real_i2s_trace);
+    qtest_add_func("/esp32/i2s-dac/real-i2s0-wrong-route",
+                   real_i2s_wrong_physical_route);
+    qtest_add_func("/esp32/i2s-dac/analytic-audio-second",
+                   analytic_audio_second);
     qtest_add_func("/esp32/i2s-dac/real-i2s0-wrong-rate", real_i2s_wrong_rate);
     return g_test_run();
 }
