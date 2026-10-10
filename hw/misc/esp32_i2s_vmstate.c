@@ -127,6 +127,7 @@ static const VMStateDescription vmstate_channel = {
         VMSTATE_UINT32(slot, Esp32I2SChannel),
         VMSTATE_UINT32(phase, Esp32I2SChannel),
         VMSTATE_UINT32(clock_bit, Esp32I2SChannel),
+        VMSTATE_UINT32_V(analytic_sample_progress, Esp32I2SChannel, 3),
         VMSTATE_UINT64(clock_remainder, Esp32I2SChannel),
         VMSTATE_INT64(deadline, Esp32I2SChannel),
         VMSTATE_UINT64_V(analytic_frame_data, Esp32I2SChannel, 2),
