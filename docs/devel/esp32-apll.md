@@ -24,7 +24,35 @@ Clock frequency derives from the programmed registers and shared crystal
 frequency. The numerator and denominator remain rational through I2S divider
 and pad-edge scheduling, so fractional hertz do not accumulate truncation
 drift. Force-power-down takes precedence over force-power-up in RTC ANA_CONF.
-Unsupported analog hosts/blocks log a guest error and do not share APLL state.
+The supported analog-I2C subset is host/block-specific: APLL block `0x6d`
+on host 3, BBPLL block `0x66` on host 4, and the RF accesses listed below.
+Other host/block/register combinations log a guest error and do not alias a
+supported bank.
+
+## RF analog-I2C subset
+
+The IDF 6.1 PHY ELF accesses RF registers through these observed host/block
+pairs: host 1/block `0x62`, host 0/blocks `0x63` and `0x64`, host 1/block
+`0x67`, host 3/block `0x68`, and host 2/blocks `0x6a` and `0x6b`. Only
+registers observed for those pairs are accepted. RF register field meanings
+and silicon reset values are not established by this access audit. Unwritten
+RF storage reads as zero and logs once; this is a provisional placeholder,
+not a hardware reset-value claim. In particular, block `0x62` reg5 is not
+given a fabricated acceptance value.
+
+The PHY ELF performs a reset/start pulse on host 1/block `0x62`/reg0 and polls
+reg7 bit7. The model clears bit7 when reset is asserted, rejects a start when
+PLL_I2C power/reference is absent, and reports completion after a fixed 20 us
+virtual-time delay. The start sequence and polled bit are observed; the delay,
+measurement result, and RF lock behavior are unverified approximations. The
+model does not infer candidate acceptance from completion and does not model
+the PHY's distinct reg5 candidate-accept/retry decision. No synthetic ppm
+trim or lock window is exposed as a silicon result. A changed tune input,
+power loss, or reset cancels an in-progress measurement.
+
+BBPLL block `0x66` on host 4 preserves observed writable setup fields and
+active-low enable gates. Its lock and calibration outputs remain zero because
+their hardware transition behavior has not been established.
 
 The ten-byte APLL analog register bank currently resets to zero in QEMU. This
 is an explicit implementation placeholder: available primary evidence does not

@@ -32,6 +32,8 @@
 #define GPIO 0x3ff44000
 #define MUX 0x3ff49000
 #define I2S 0x3ff4f000
+#define RFPLL_TUNE 0x3ff4e0c4
+#define DPORT_WIFI_CLK_EN 0x3ff000cc
 #define WIFI_CLK_EN 0x3ff000cc
 #define CORE_RST_EN 0x3ff000d0
 #define WIFI_CLK_COMMON 0x000003c9
@@ -40,7 +42,9 @@
 #define WIFI_CLK_BT (0x61u << 11)
 #define WIFI_PHY_REQUIRED 0x00008f8f
 
-static QTestState *start(const char *trace, bool rev1, char **efuse_name)
+static QTestState *start_with_global(const char *trace, bool rev1,
+                                     const char *extra_global,
+                                     char **efuse_name)
 {
     uint8_t efuse[124] = { 0 }; /* seven BLK0 words and three eight-word blocks */
     int fd = g_file_open_tmp("esp32-apll-efuse-XXXXXX", efuse_name, NULL);
@@ -57,8 +61,8 @@ static QTestState *start(const char *trace, bool rev1, char **efuse_name)
     g_autofree char *args = g_strdup_printf(
         "-machine esp32 -display none -serial none -nic none "
         "-drive file=%s,if=none,id=apll-efuse,format=raw "
-        "-global driver=nvram.esp32.efuse,property=drive,value=apll-efuse%s",
-        *efuse_name, trace_arg);
+        "-global driver=nvram.esp32.efuse,property=drive,value=apll-efuse %s%s",
+        *efuse_name, extra_global ? extra_global : "", trace_arg);
     QTestState *q = qtest_init(args);
     g_assert_cmpint(!!(qtest_readl(q, EFUSE_RDATA3) & (1 << 15)), ==, rev1);
     qtest_writel(q, RTC_OPTIONS0,
@@ -67,6 +71,11 @@ static QTestState *start(const char *trace, bool rev1, char **efuse_name)
                  0x3ff00 & ~ANA_APLL_DISABLED & ~ANA_BBPLL_DISABLED);
     qtest_writel(q, RTC_ANA_CONF, FORCE_PU);
     return q;
+}
+
+static QTestState *start(const char *trace, bool rev1, char **efuse_name)
+{
+    return start_with_global(trace, rev1, NULL, efuse_name);
 }
 
 static uint32_t complete(QTestState *q, uint64_t address)
@@ -96,6 +105,197 @@ static unsigned read_reg(QTestState *q, uint64_t alias, unsigned host,
     uint64_t address = alias + host * 4;
     qtest_writel(q, address, reg << 8 | block);
     return (complete(q, address) >> 16) & 255;
+}
+
+static void finish(QTestState *q, char *efuse_name);
+
+static void test_observed_rf_analog_registers(void)
+{
+    static const struct {
+        unsigned host, block, reg;
+    } observed[] = {
+        { 1, 0x62, 0 }, { 1, 0x62, 1 }, { 1, 0x62, 2 },
+        { 1, 0x62, 3 }, { 1, 0x62, 4 }, { 1, 0x62, 8 },
+        { 1, 0x62, 9 }, { 1, 0x62, 10 },
+        { 0, 0x63, 0 }, { 0, 0x63, 1 }, { 0, 0x63, 3 },
+        { 0, 0x63, 4 }, { 0, 0x63, 5 },
+        { 0, 0x64, 4 }, { 0, 0x64, 7 },
+        { 1, 0x67, 0 }, { 1, 0x67, 1 }, { 1, 0x67, 2 },
+        { 1, 0x67, 3 }, { 1, 0x67, 4 }, { 1, 0x67, 5 },
+        { 1, 0x67, 6 }, { 1, 0x67, 7 }, { 1, 0x67, 8 },
+        { 1, 0x67, 9 }, { 1, 0x67, 10 }, { 1, 0x67, 11 },
+        { 1, 0x67, 12 }, { 1, 0x67, 15 },
+        { 3, 0x68, 0 }, { 3, 0x68, 1 },
+        { 2, 0x6a, 0 }, { 2, 0x6a, 2 }, { 2, 0x6a, 4 },
+        { 2, 0x6a, 5 }, { 2, 0x6a, 6 },
+        { 2, 0x6b, 1 }, { 2, 0x6b, 2 }, { 2, 0x6b, 3 },
+        { 2, 0x6b, 4 }, { 2, 0x6b, 5 }, { 2, 0x6b, 6 },
+        { 2, 0x6b, 7 }, { 2, 0x6b, 9 }, { 2, 0x6b, 10 },
+    };
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+
+    /* Exact host/block/register accesses observed in the supplied IDF 6.1
+     * PHY ELF. Their analog field meanings and reset values remain unknown. */
+    for (unsigned i = 0; i < G_N_ELEMENTS(observed); i++) {
+        unsigned value = 0x31 + i;
+        write_reg(q, ANA_APB, observed[i].host, observed[i].block,
+                  observed[i].reg, value);
+        g_assert_cmphex(read_reg(q, ANA_APB, observed[i].host,
+                                 observed[i].block, observed[i].reg),
+                        ==, value);
+    }
+
+    /* Block 0x62 reg7 is polled by PHY code as status. It remains visibly
+     * unmodeled; a read must complete without inventing readiness. */
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7), ==, 0);
+    /* Host/block and register pairs outside the captured access set stay
+     * unsupported rather than falling through to generic register storage. */
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x67, 13), ==, 0);
+    g_assert_cmphex(read_reg(q, ANA_APB, 4, 0x67, 5), ==, 0);
+    finish(q, efuse_name);
+}
+
+static void test_rf_analog_power_cancels_pending(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    uint64_t command = ANA_APB + 2 * 4;
+    uint32_t old_options = qtest_readl(q, RTC_OPTIONS0);
+
+    write_reg(q, ANA_APB, 2, 0x6b, 3, 0xa8);
+    qtest_writel(q, command, COMMAND_WRITE | (0x5a << 16) | (3 << 8) |
+                            0x6b);
+    g_assert_true(qtest_readl(q, command) & COMMAND_BUSY);
+    qtest_writel(q, RTC_OPTIONS0, old_options | (1u << 18));
+    g_assert_cmphex(qtest_readl(q, command), ==, 0);
+    qtest_writel(q, RTC_OPTIONS0, old_options & ~(1u << 18));
+    g_assert_cmphex(read_reg(q, ANA_APB, 2, 0x6b, 3), ==, 0xa8);
+    finish(q, efuse_name);
+}
+
+static void rfpll_start_sequence(QTestState *q)
+{
+    /* Exact host1/block0x62/reg0 reset and calibration pulse sequence
+     * decoded from the supplied IDF 6.1 regi2c masked-write helper. */
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x50);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x30);
+}
+
+static void test_rfpll_calibration_controller(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+
+    qtest_writel(q, DPORT_WIFI_CLK_EN, 0x406);
+    qtest_writel(q, RFPLL_TUNE, 0xd8 | (1u << 8));
+    qtest_clock_step(q, 2000);
+    g_assert_cmphex(qtest_readl(q, RFPLL_TUNE) & 0xff, ==, 0xd8);
+    g_assert_false(qtest_readl(q, RFPLL_TUNE) & (1u << 8));
+
+    /* Without PLL_I2C_PU the controller must not report completion. */
+    rfpll_start_sequence(q);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+
+    /* The register handshake initiates a measurement even when no channel
+     * tune code has been sent. CAL_END denotes completion, not acceptance. */
+    qtest_writel(q, RTC_ANA_CONF,
+                 qtest_readl(q, RTC_ANA_CONF) | (1u << 31));
+    rfpll_start_sequence(q);
+    qtest_clock_step(q, 10000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+    qtest_clock_step(q, 20000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, CAL_END);
+
+    /* Power loss during the reset/start handshake clears the partial
+     * sequence; restoring power cannot complete an abandoned measurement. */
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    qtest_writel(q, RTC_ANA_CONF,
+                 qtest_readl(q, RTC_ANA_CONF) & ~(1u << 31));
+    qtest_writel(q, RTC_ANA_CONF,
+                 qtest_readl(q, RTC_ANA_CONF) | (1u << 31));
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x50);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x30);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+
+    rfpll_start_sequence(q);
+    /* Losing analog PLL power while a fresh measurement is pending cancels
+     * the timer. */
+    qtest_writel(q, RTC_ANA_CONF,
+                 qtest_readl(q, RTC_ANA_CONF) & ~(1u << 31));
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+
+    qtest_writel(q, RTC_ANA_CONF,
+                 qtest_readl(q, RTC_ANA_CONF) | (1u << 31));
+    rfpll_start_sequence(q);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, CAL_END);
+
+    /* A tune input change invalidates an in-flight measurement. */
+    rfpll_start_sequence(q);
+    qtest_writel(q, RFPLL_TUNE, 0xe2 | (1u << 8));
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+    rfpll_start_sequence(q);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, CAL_END);
+
+    /* Candidate sweeps all complete independently of any synthetic tune
+     * acceptance window; the PHY evaluates candidate acceptance separately. */
+    static const uint8_t scan_candidates[] = { 0, 2, 251 };
+    for (unsigned i = 0; i < G_N_ELEMENTS(scan_candidates); i++) {
+        qtest_writel(q, RFPLL_TUNE, scan_candidates[i] | (1u << 8));
+        qtest_clock_step(q, 2000);
+        rfpll_start_sequence(q);
+        qtest_clock_step(q, 500000);
+        g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END,
+                        ==, CAL_END);
+    }
+
+    /* Reset assertion cancels an in-flight calibration and drops status. */
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x50);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x30);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+
+    /* A reset/start sequence without the required low/high start pulse is
+     * not accepted as a calibration request. */
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x30);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x70);
+    write_reg(q, ANA_APB, 1, 0x62, 0, 0x30);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+    finish(q, efuse_name);
+}
+
+static void test_rfpll_rejects_invalid_reference(void)
+{
+    char *efuse_name;
+    QTestState *q = start_with_global(
+        NULL, true,
+        "-global driver=misc.esp32.rtc_cntl,property=xtal-apb-freq,value=0",
+        &efuse_name);
+
+    qtest_writel(q, DPORT_WIFI_CLK_EN, 0x406);
+    qtest_writel(q, RTC_ANA_CONF,
+                 qtest_readl(q, RTC_ANA_CONF) | (1u << 31));
+    qtest_writel(q, RFPLL_TUNE, 0xd8 | (1u << 8));
+    qtest_clock_step(q, 2000);
+    rfpll_start_sequence(q);
+    qtest_clock_step(q, 200000);
+    g_assert_cmphex(read_reg(q, ANA_APB, 1, 0x62, 7) & CAL_END, ==, 0);
+    finish(q, efuse_name);
 }
 
 static void apll_write(QTestState *q, unsigned reg, unsigned value)
@@ -145,12 +345,119 @@ static void test_alias_and_host(void)
     g_assert_cmphex(apll_read(q, 9), ==, 0xa5);
     apll_write(q, 8, 0x5a);
     g_assert_cmphex(read_reg(q, ANA_DPORT, APLL_HOST, APLL_BLOCK, 8), ==, 0x5a);
-    /* BBPLL is outside this model's supported analog subset. Its traffic
-     * must be reported as unsupported and must not alias the APLL bank;
-     * this test makes no claim about BBPLL command/data silicon behavior. */
     write_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2, 0x65);
+    g_assert_cmphex(read_reg(q, ANA_DPORT, BBPLL_HOST, BBPLL_BLOCK, 2), ==,
+                    0x65);
+    write_reg(q, ANA_APB, APLL_HOST, BBPLL_BLOCK, 2, 0x9a);
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2), ==,
+                    0x65);
+    qtest_writel(q, ANA_APB + 8 * 4,
+                 COMMAND_WRITE | (0xa5 << 16) | (2 << 8) | BBPLL_BLOCK);
+    g_assert_cmphex(qtest_readl(q, ANA_APB + 8 * 4), ==, 0);
     g_assert_cmphex(apll_read(q, 9), ==, 0xa5);
     g_assert_cmphex(apll_read(q, 8), ==, 0x5a);
+    finish(q, efuse_name);
+}
+
+static void test_bbpll_block_gates(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    uint32_t config = qtest_readl(q, ANA_APB + ANA_CONFIG);
+
+    /* APLL's disable bit must not gate a BBPLL transaction. */
+    qtest_writel(q, ANA_APB + ANA_CONFIG, config | ANA_APLL_DISABLED);
+    uint64_t command = ANA_APB + BBPLL_HOST * 4;
+    qtest_writel(q, command, COMMAND_WRITE | (0x65 << 16) | (2 << 8) |
+                            BBPLL_BLOCK);
+    g_assert_true(qtest_readl(q, command) & COMMAND_BUSY);
+    qtest_writel(q, ANA_APB + ANA_CONFIG,
+                 config | ANA_APLL_DISABLED);
+    g_assert_true(qtest_readl(q, command) & COMMAND_BUSY);
+    g_assert_cmphex(complete(q, command) >> 16, ==, 0x65);
+
+    /* The BBPLL disable bit blocks writes without altering the slave bank. */
+    qtest_writel(q, command, COMMAND_WRITE | (0x9a << 16) | (2 << 8) |
+                            BBPLL_BLOCK);
+    g_assert_true(qtest_readl(q, command) & COMMAND_BUSY);
+    qtest_writel(q, ANA_APB + ANA_CONFIG, config | ANA_BBPLL_DISABLED);
+    g_assert_cmphex(qtest_readl(q, command), ==, 0);
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2), ==, 0);
+    qtest_writel(q, ANA_APB + ANA_CONFIG, config);
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2), ==,
+                    0x65);
+
+    qtest_writel(q, RTC_OPTIONS0,
+                 qtest_readl(q, RTC_OPTIONS0) | (1u << 18));
+    write_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2, 0x9a);
+    qtest_writel(q, RTC_OPTIONS0,
+                 qtest_readl(q, RTC_OPTIONS0) & ~(1u << 18));
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2), ==,
+                    0x65);
+
+    static const uint32_t bbpll_power_down[] = { 1u << 6, 1u << 8 };
+    for (unsigned i = 0; i < G_N_ELEMENTS(bbpll_power_down); i++) {
+        qtest_writel(q, RTC_OPTIONS0,
+                     qtest_readl(q, RTC_OPTIONS0) | bbpll_power_down[i]);
+        write_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2, 0x9a);
+        qtest_writel(q, RTC_OPTIONS0,
+                     qtest_readl(q, RTC_OPTIONS0) & ~bbpll_power_down[i]);
+        g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2), ==,
+                        0x65);
+    }
+    finish(q, efuse_name);
+}
+
+static void test_bbpll_register_fields(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    static const uint8_t masks[] = {
+        0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0, 0,
+        0xff, 0xf3, 0xff, 0xff, 0xff,
+    };
+
+    for (unsigned reg = 0; reg < G_N_ELEMENTS(masks); reg++) {
+        write_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, reg, 0xff);
+        g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, reg),
+                        ==, masks[reg]);
+    }
+    write_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 13, 0xff);
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 2), ==,
+                    0xff);
+    finish(q, efuse_name);
+}
+
+static void test_bbpll_rom_setup_values(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    static const struct {
+        uint8_t reg;
+        uint8_t value;
+    } setup[] = {
+        { 0, 0x18 }, { 1, 0x20 }, { 4, 0x9a }, { 10, 0x00 },
+        { 12, 0x00 }, { 11, 0x43 }, { 9, 0x84 }, { 2, 0x00 },
+        { 3, 0x20 }, { 5, 0xc6 },
+    };
+
+    /* These register/value pairs are present in the supplied IDF 6.1 ELF's
+     * BBPLL setup sequence (block 0x66, host 4). */
+    for (unsigned i = 0; i < G_N_ELEMENTS(setup); i++) {
+        write_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK,
+                  setup[i].reg, setup[i].value);
+    }
+    for (unsigned i = 0; i < G_N_ELEMENTS(setup); i++) {
+        uint8_t expected = setup[i].value;
+        if (setup[i].reg == 9) {
+            expected &= 0xf3; /* reg9 bits 3:2 are reserved */
+        }
+        g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK,
+                                 setup[i].reg), ==, expected);
+    }
+    /* The model does not claim a calibrated or locked PLL. */
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 6), ==, 0);
+    g_assert_cmphex(read_reg(q, ANA_APB, BBPLL_HOST, BBPLL_BLOCK, 7), ==, 0);
     finish(q, efuse_name);
 }
 
@@ -250,6 +557,31 @@ static void test_power_dominance(void)
         qtest_clock_step(q, 2000);
         g_assert_cmphex(qtest_readl(q, GPIO + 0x3c) & (1 << 18), ==, held);
     }
+    finish(q, efuse_name);
+}
+
+static void test_apll_clock_independent_of_regi2c_gate(void)
+{
+    char *efuse_name;
+    QTestState *q = start(NULL, true, &efuse_name);
+    uint32_t config = qtest_readl(q, ANA_APB + ANA_CONFIG);
+
+    calibrate(q, true, 0);
+    start_clock(q);
+    qtest_clock_step(q, 2000);
+    g_assert_true(qtest_readl(q, GPIO + 0x3c) & (1 << 18));
+
+    /* ANA_CONFIG's active-low APLL bit controls the internal register-I2C
+     * interface; only RTC_ANA_CONF controls this model's APLL output power. */
+    qtest_writel(q, ANA_APB + ANA_CONFIG,
+                 config | ANA_APLL_DISABLED | ANA_BBPLL_DISABLED);
+    qtest_clock_step(q, 2000);
+    g_assert_false(qtest_readl(q, GPIO + 0x3c) & (1 << 18));
+    qtest_writel(q, ANA_APB + ANA_CONFIG,
+                 config & ~(ANA_APLL_DISABLED | ANA_BBPLL_DISABLED));
+    qtest_clock_step(q, 2000);
+    g_assert_true(qtest_readl(q, GPIO + 0x3c) & (1 << 18));
+    qtest_writel(q, I2S + 8, 0);
     finish(q, efuse_name);
 }
 
@@ -370,12 +702,28 @@ int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/esp32/apll-mmio/aliases-and-hosts", test_alias_and_host);
+    qtest_add_func("/esp32/apll-mmio/bbpll-block-gates",
+                   test_bbpll_block_gates);
+    qtest_add_func("/esp32/apll-mmio/bbpll-register-fields",
+                   test_bbpll_register_fields);
+    qtest_add_func("/esp32/apll-mmio/bbpll-rom-setup-values",
+                   test_bbpll_rom_setup_values);
+    qtest_add_func("/esp32/apll-mmio/observed-rf-registers",
+                   test_observed_rf_analog_registers);
+    qtest_add_func("/esp32/apll-mmio/rf-power-cancels-pending",
+                   test_rf_analog_power_cancels_pending);
+    qtest_add_func("/esp32/apll-mmio/rfpll-calibration-controller",
+                   test_rfpll_calibration_controller);
+    qtest_add_func("/esp32/apll-mmio/rfpll-invalid-reference",
+                   test_rfpll_rejects_invalid_reference);
     qtest_add_func("/esp32/apll-mmio/calibration-no-trigger", test_no_trigger);
     qtest_add_data_func("/esp32/apll-mmio/rational-trace-rev1",
                        GINT_TO_POINTER(true), test_fractional_trace);
     qtest_add_data_func("/esp32/apll-mmio/fraction-ignored-rev0",
                        GINT_TO_POINTER(false), test_fractional_trace);
     qtest_add_func("/esp32/apll-mmio/power-dominance", test_power_dominance);
+    qtest_add_func("/esp32/apll-mmio/regi2c-gate-clock-independence",
+                   test_apll_clock_independent_of_regi2c_gate);
     qtest_add_func("/esp32/apll-mmio/masks-and-bus-reset", test_masks_and_bus_reset);
     static const char *cancel_names[] = { "power", "analog-reset",
         "invalid-coefficient", "system-reset" };
