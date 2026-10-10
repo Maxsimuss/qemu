@@ -4,6 +4,10 @@ ESP32 digital peripheral testing
 Run original ESP32 firmware with the ``esp32`` machine. The I2C and I2S
 controllers access guest registers, FIFOs and DMA memory. GPIO matrix/IOMUX
 routing resolves their digital signals together with pulls and external drives.
+When TX-master BCLK/WS routes feed an RX slave and its resolved DIN pad is
+stable, I2S advances the serial frame analytically while preserving sample and
+DMA completion times. A DIN transition commits samples through the transition
+before the clock path switches to individual edges.
 
 Capture pads without a graphical interface::
 
