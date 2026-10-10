@@ -948,7 +948,8 @@ bool esp32_gpio_output_feeds_input(Esp32GpioState *s, unsigned output_signal,
         if (output & (BIT(10) | BIT(11)) || pin & BIT(2)) {
             continue;
         }
-        if ((input & BIT(7)) && !(input & BIT(6)) && (input & 63) == pad &&
+        if (mux_function(s, pad) == 2 && (input & BIT(7)) &&
+            !(input & BIT(6)) && (input & 63) == pad &&
             (mux_value(s, pad) & IOMUX_IE) && selected_output(s, pad) ==
                 output_signal) {
             found = true;
