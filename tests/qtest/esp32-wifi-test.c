@@ -165,8 +165,9 @@ static void extended_mac_window_reset(void)
     qtest_irq_intercept_out_named(q, INTMATRIX_PATH, "cpu-irq");
     qtest_writel(q, MATRIX, 1);
     wifi_enable_mac(q);
-    g_assert_cmphex(qtest_readl(q, WIFI_DPORT + WIFI_CRYPTO_KEY_TABLE), ==, 0);
-    qtest_writel(q, WIFI_DPORT + WIFI_CRYPTO_KEY_TABLE, 0xdeadbeef);
+    qtest_writel(q, WIFI_DPORT + WIFI_CRYPTO_KEY_TABLE + 31 * 40 + 36,
+                 0xdeadbeef);
+    qtest_writel(q, WIFI_DPORT + WIFI_CRYPTO_KEY_VALID, 1U << 31);
     qtest_memwrite(q, 0x3ffb0000, (uint8_t *)rx_descriptor,
                    sizeof(rx_descriptor));
     qtest_writel(q, WIFI_DPORT + WIFI_DMA_INLINK, 0x3ffb0000);
@@ -179,6 +180,9 @@ static void extended_mac_window_reset(void)
     qtest_qmp_assert_success(q, "{ 'execute': 'system_reset' }");
     qtest_qmp_eventwait(q, "RESET");
     g_assert_cmphex(qtest_readl(q, WIFI_APB + WIFI_CRYPTO_KEY_TABLE), ==, 0);
+    g_assert_cmphex(qtest_readl(q, WIFI_APB + WIFI_CRYPTO_KEY_TABLE +
+                                31 * 40 + 36), ==, 0);
+    g_assert_cmphex(qtest_readl(q, WIFI_DPORT + WIFI_CRYPTO_KEY_VALID), ==, 0);
     g_assert_cmphex(qtest_readl(q, WIFI_DPORT + WIFI_DMA_INT_STATUS), ==, 0);
     g_assert_false(qtest_get_irq(q, 1));
     qtest_clock_step(q, 5000000);
