@@ -844,6 +844,11 @@ static void real_i2s_wrong_physical_route(void)
  */
 static void analytic_audio_second(void)
 {
+    if (!qtest_has_device("esp32-tas5828m") ||
+        !qtest_has_device("esp32-tas5830")) {
+        g_test_skip("optional TAS models are not built in this QEMU tree");
+        return;
+    }
     g_autofree char *devices = g_strdup(
         "-device esp32-tas5828m,gpio=/machine/soc/gpio,address=0x61,"
         "driver-slot=2,bclk=18,ws=19,data=23 "
