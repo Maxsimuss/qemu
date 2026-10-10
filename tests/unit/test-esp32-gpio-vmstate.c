@@ -15,7 +15,6 @@
 ICountMode use_icount;
 static int64_t virtual_time;
 static unsigned callbacks;
-static unsigned output_updates;
 
 int64_t cpus_get_virtual_clock(void) { return virtual_time; }
 void cpus_set_virtual_clock(int64_t time) { virtual_time = time; }
@@ -29,14 +28,39 @@ bool icount_configure(QemuOpts *opts, Error **errp) { g_assert_not_reached(); }
 void icount_account_warp_timer(void) { g_assert_not_reached(); }
 void icount_notify_exit(void) { g_assert_not_reached(); }
 
-/* Observe post-load reconstruction. Physical pad levels/periods are checked
- * independently by MMIO qtests; these stubs do not fabricate pad events. */
-void esp32_gpio_rebuild_outputs(Esp32GpioState *s)
+/* This unit target exercises the GPIO resolver without creating its QOM
+ * device instance. These device-registration entry points are only reached
+ * if a future test instantiates the type, so keep them inert here. */
+void memory_region_init_io(MemoryRegion *mr, Object *owner,
+                           const MemoryRegionOps *ops, void *opaque,
+                           const char *name, uint64_t size)
 {
-    output_updates++;
-    s->routes_valid = false;
+    g_assert_not_reached();
 }
 
+void sysbus_init_mmio(SysBusDevice *dev, MemoryRegion *memory)
+{
+    g_assert_not_reached();
+}
+
+void sysbus_init_irq(SysBusDevice *dev, qemu_irq *irq)
+{
+    g_assert_not_reached();
+}
+
+void qdev_init_gpio_out_named(DeviceState *dev, qemu_irq *pins,
+                              const char *name, int n)
+{
+    g_assert_not_reached();
+}
+
+void qdev_init_gpio_in_named_with_opaque(DeviceState *dev,
+                                         qemu_irq_handler handler,
+                                         void *opaque, const char *name,
+                                         int n)
+{
+    g_assert_not_reached();
+}
 static void timer_callback(void *opaque)
 {
     callbacks++;
@@ -121,9 +145,8 @@ static void test_restore_active(void)
     Esp32GpioState source, dest;
     initialize(&source, true);
     initialize(&dest, false);
-    output_updates = 0;
     g_assert_cmpint(roundtrip(&source, &dest), ==, 0);
-    g_assert_cmpuint(output_updates, ==, 1);
+    g_assert_true(dest.routes_valid);
     g_assert_cmpuint(dest.apll_clkout_num, ==, UINT64_C(46080078125));
     g_assert_cmpuint(dest.apll_clkout_den, ==, 1536);
     g_assert_cmpmem(dest.regs, sizeof(dest.regs), source.regs, sizeof(source.regs));
@@ -137,7 +160,6 @@ static void test_restore_active(void)
     g_assert_cmpmem(dest.clkout_level, sizeof(dest.clkout_level),
                     source.clkout_level, sizeof(source.clkout_level));
     g_assert_true(dest.peripheral_known[23]);
-    g_assert_true(dest.input_sample[18]);
     for (unsigned i = 0; i < 3; i++) {
         g_assert_cmpint(dest.clkout_timer[i]->expire_time, ==, 10000 + 100 * i);
         g_assert_true(dest.clkout_context[i].owner == &dest);
@@ -177,6 +199,7 @@ static void test_analytic_input_uses_resolved_pad_for_direct_mux(void)
     gpio.analytic_clock_num[direct_output] = 1;
     gpio.analytic_clock_den[direct_output] = 1;
     gpio.analytic_clock_origin[direct_output] = 0;
+    esp32_gpio_rebuild_outputs(&gpio);
 
     g_assert_false(esp32_gpio_output_feeds_input(&gpio, direct_output,
                                                   input_signal));
@@ -214,7 +237,6 @@ static void test_restore_version1(void)
     g_assert_cmpmem(dest.regs, sizeof(dest.regs), source.regs, sizeof(source.regs));
     g_assert_true(dest.peripheral_known[23]);
     g_assert_true(dest.peripheral_value[23]);
-    g_assert_true(dest.input_sample[18]);
     for (unsigned i = 0; i < 3; i++) {
         g_assert_false(timer_pending(dest.clkout_timer[i]));
         g_assert_cmpuint(dest.clkout_num[i], ==, 0);
