@@ -76,6 +76,7 @@ if have_block
     'test-block-iothread': [testblock],
     'test-write-threshold': [testblock],
     'test-crypto-hash': [crypto],
+    'test-esp32-wifi-security': ['../../hw/xtensa/esp32_wifi_security.c', crypto],
     'test-crypto-hmac': [crypto],
     'test-crypto-cipher': [crypto],
     'test-crypto-akcipher': [crypto],

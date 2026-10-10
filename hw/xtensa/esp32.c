@@ -24,6 +24,7 @@
 #include "hw/i2c/i2c.h"
 #include "hw/qdev-properties.h"
 #include "hw/xtensa/esp32.h"
+#include "hw/xtensa/esp32_wifi.h"
 #include "hw/misc/ssi_psram.h"
 #include "hw/sd/dwc_sdmmc.h"
 #include "core-esp32/core-isa.h"
@@ -938,10 +939,49 @@ struct Esp32MachineState {
 
     Esp32SocState esp32;
     DeviceState *flash_dev;
+    char *wifi_peer_ssid;
+    char *wifi_peer_password;
+    uint8_t wifi_peer_channel;
 };
 #define TYPE_ESP32_MACHINE MACHINE_TYPE_NAME("esp32")
 
 OBJECT_DECLARE_SIMPLE_TYPE(Esp32MachineState, ESP32_MACHINE)
+
+static void esp32_machine_instance_init(Object *obj)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    ms->wifi_peer_channel = 1;
+    object_property_add_uint8_ptr(obj, "wifi-peer-channel",
+                                  &ms->wifi_peer_channel,
+                                  OBJ_PROP_FLAG_READ | OBJ_PROP_FLAG_WRITE);
+}
+
+static char *esp32_machine_get_wifi_peer_ssid(Object *obj, Error **errp)
+{
+    return g_strdup(ESP32_MACHINE(obj)->wifi_peer_ssid);
+}
+
+static void esp32_machine_set_wifi_peer_ssid(Object *obj, const char *value,
+                                              Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->wifi_peer_ssid);
+    ms->wifi_peer_ssid = g_strdup(value);
+}
+
+static char *esp32_machine_get_wifi_peer_password(Object *obj, Error **errp)
+{
+    return g_strdup(ESP32_MACHINE(obj)->wifi_peer_password);
+}
+
+static void esp32_machine_set_wifi_peer_password(Object *obj,
+                                                  const char *value,
+                                                  Error **errp)
+{
+    Esp32MachineState *ms = ESP32_MACHINE(obj);
+    g_free(ms->wifi_peer_password);
+    ms->wifi_peer_password = g_strdup(value);
+}
 
 
 static void esp32_machine_init_spi_flash(Esp32SocState *ss, BlockBackend* blk)
@@ -980,6 +1020,47 @@ static void esp32_machine_init_psram(Esp32SocState *ss, uint32_t size_mbytes)
     qdev_realize_and_unref(psram, spi_bus, &error_fatal);
     qdev_connect_gpio_out_named(spi_master, SSI_GPIO_CS, 1,
                                 qdev_get_gpio_in_named(psram, SSI_GPIO_CS, 0));
+}
+
+static void esp32_machine_init_wifi(Esp32SocState *ss, Esp32MachineState *ms)
+{
+    MemoryRegion *sys_mem = get_system_memory();
+    /* The ESP32 MAC is physical SoC hardware.  Always realize its MMIO,
+     * interrupt, and DMA engine; a network backend is an optional peer. */
+    DeviceState *wifi = qdev_new("misc.esp32_wifi");
+    SysBusDevice *sbd;
+
+    if (ms->wifi_peer_ssid) {
+        qdev_prop_set_string(wifi, "peer-ssid", ms->wifi_peer_ssid);
+    }
+    if (ms->wifi_peer_password) {
+        qdev_prop_set_string(wifi, "peer-password", ms->wifi_peer_password);
+    }
+    qdev_prop_set_uint8(wifi, "peer-channel", ms->wifi_peer_channel);
+    qemu_configure_nic_device(wifi, true, NULL);
+    ss->wifi = wifi;
+    sbd = SYS_BUS_DEVICE(wifi);
+    sysbus_realize_and_unref(sbd, &error_fatal);
+    for (unsigned bit = 0; bit < 32; bit++) {
+        qdev_connect_gpio_out_named(DEVICE(&ss->dport),
+                                    ESP32_DPORT_WIFI_CLOCK_GPIO, bit,
+                                    qdev_get_gpio_in_named(wifi,
+                                        ESP32_WIFI_CLOCK_GPIO, bit));
+        qdev_connect_gpio_out_named(DEVICE(&ss->dport),
+                                    ESP32_DPORT_CORE_RESET_GPIO, bit,
+                                    qdev_get_gpio_in_named(wifi,
+                                        ESP32_WIFI_RESET_GPIO, bit));
+    }
+    sysbus_connect_irq(sbd, 0,
+                       qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_WIFI_MAC_INTR_SOURCE));
+    memory_region_add_subregion(sys_mem, DR_REG_WIFI_BASE,
+                                 sysbus_mmio_get_region(sbd, 0));
+    /* The ESP32 APB view used by firmware aliases the legacy Wi-Fi block. */
+    MemoryRegion *wifi_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_apb, OBJECT(wifi), "esp32.wifi-apb",
+                             sysbus_mmio_get_region(sbd, 0), 0,
+                             ESP32_WIFI_MMIO_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x60033000, wifi_apb, 0);
 }
 
 static void esp32_machine_init_openeth(Esp32SocState *ss)
@@ -1055,6 +1136,7 @@ static void esp32_machine_init(MachineState *machine)
     }
 
 
+    esp32_machine_init_wifi(ss, ms);
     esp32_machine_init_openeth(ss);
 
     esp32_machine_init_sd(ss);
@@ -1152,18 +1234,26 @@ static ram_addr_t esp32_fixup_ram_size(ram_addr_t requested_size)
 static void esp32_machine_class_init(ObjectClass *oc, void *data)
 {
     MachineClass *mc = MACHINE_CLASS(oc);
+
     mc->desc = "Espressif ESP32 machine";
     mc->init = esp32_machine_init;
     mc->max_cpus = 2;
     mc->default_cpus = 2;
     mc->default_ram_size = 0;
     mc->fixup_ram_size = esp32_fixup_ram_size;
+    object_class_property_add_str(oc, "wifi-peer-ssid",
+                                  esp32_machine_get_wifi_peer_ssid,
+                                  esp32_machine_set_wifi_peer_ssid);
+    object_class_property_add_str(oc, "wifi-peer-password",
+                                  esp32_machine_get_wifi_peer_password,
+                                  esp32_machine_set_wifi_peer_password);
 }
 
 static const TypeInfo esp32_info = {
     .name = TYPE_ESP32_MACHINE,
     .parent = TYPE_MACHINE,
     .instance_size = sizeof(Esp32MachineState),
+    .instance_init = esp32_machine_instance_init,
     .class_init = esp32_machine_class_init,
 };
 
