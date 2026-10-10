@@ -7,7 +7,7 @@ xtensa_ss.add(files(
 xtensa_ss.add(when: 'CONFIG_XTENSA_SIM', if_true: files('sim.c'))
 xtensa_ss.add(when: 'CONFIG_XTENSA_VIRT', if_true: files('virt.c'))
 xtensa_ss.add(when: 'CONFIG_XTENSA_XTFPGA', if_true: files('xtfpga.c'))
-xtensa_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32.c', 'esp32_intc.c'))
+xtensa_ss.add(when: 'CONFIG_XTENSA_ESP32', if_true: files('esp32.c', 'esp32_intc.c', 'esp32_wifi.c', 'esp32_wifi_ap.c', 'esp32_wifi_security.c', 'esp32_wlan_packet.c'))
 xtensa_ss.add(when: 'CONFIG_XTENSA_ESP32S3', if_true: files(
   'esp32s3_clk.c',
   'esp32s3_intc.c',
