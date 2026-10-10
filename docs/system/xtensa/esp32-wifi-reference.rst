@@ -10,8 +10,9 @@ from the ESP32 Open MAC QEMU repository:
 * Pinned repository commit: ``431466030220be88fb2df750abff6fcdcd13299a``
 * MAC implementation provenance: ``4a5c772afec5eef22716a908e115ebd1062210fa``
   (2023-09-07, ``Implement memory logging``)
-* License: GPL-2.0-or-later, inherited from QEMU for the model files. The
-  frame helper files also retain Clemens Kolbitsch's MIT-style notice.
+* License: ``hw/xtensa/esp32_wifi.c`` follows QEMU's GPL-2.0-or-later terms.
+  ``esp32_wifi_ap.c``, ``esp32_wlan.h``, and the 802.11 frame helper files
+  retain Clemens Kolbitsch's MIT license notice.
 
 The model is a reverse-engineering starting point. Register values and behavior
 in this code were inferred from proprietary ESP32 Wi-Fi firmware and are not a

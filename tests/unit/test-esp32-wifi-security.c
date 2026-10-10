@@ -1,3 +1,4 @@
+/* SPDX-License-Identifier: GPL-2.0-or-later */
 /* WPA2 peer key derivation and CCMP data protection tests. */
 #include "qemu/osdep.h"
 #include "crypto/init.h"
