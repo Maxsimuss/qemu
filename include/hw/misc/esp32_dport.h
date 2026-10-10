@@ -77,8 +77,11 @@ typedef struct Esp32DportState {
     uint32_t perip_clk_en;
     uint32_t perip_rst_en;
     uint32_t wifi_clk_en;
+    uint32_t core_rst_en;
     qemu_irq perip_clock[32];
     qemu_irq perip_reset[32];
+    qemu_irq wifi_clock[32];
+    qemu_irq core_reset[32];
 
 } Esp32DportState;
 
@@ -92,12 +95,15 @@ void esp32_dport_clear_ill_trap_state(Esp32DportState* s);
 #define ESP32_DPORT_FLASH_DEC_EN_GPIO   "flash-dec-en"
 #define ESP32_DPORT_PERIP_CLOCK_GPIO    "periph-clock"
 #define ESP32_DPORT_PERIP_RESET_GPIO    "periph-reset"
+#define ESP32_DPORT_WIFI_CLOCK_GPIO     "wifi-clock"
+#define ESP32_DPORT_CORE_RESET_GPIO     "core-reset"
 
 REG32(DPORT_PERIP_CLK_EN, 0xc0)
 REG32(DPORT_PERIP_RST_EN, 0xc4)
 
 /* ESP-IDF esp32 dport_reg.h: full-width R/W, reset value 0xfffce030. */
 REG32(DPORT_WIFI_CLK_EN, 0xcc)
+REG32(DPORT_CORE_RST_EN, 0xd0)
 
 
 REG32(DPORT_APPCPU_RESET, 0x2c)

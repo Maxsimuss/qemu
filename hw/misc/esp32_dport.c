@@ -69,6 +69,8 @@ static uint64_t esp32_dport_read(void *opaque, hwaddr addr, unsigned int size)
         return s->perip_rst_en;
     case A_DPORT_WIFI_CLK_EN:
         return s->wifi_clk_en;
+    case A_DPORT_CORE_RST_EN:
+        return s->core_rst_en;
     case A_DPORT_APPCPU_RESET:
         r = s->appcpu_reset_state;
         break;
@@ -156,6 +158,15 @@ static void esp32_dport_write(void *opaque, hwaddr addr,
     case A_DPORT_WIFI_CLK_EN:
         /* The ESP32 register is a full-width R/W clock-enable bitmap. */
         s->wifi_clk_en = value;
+        for (unsigned i = 0; i < 32; i++) {
+            qemu_set_irq(s->wifi_clock[i], (value >> i) & 1);
+        }
+        break;
+    case A_DPORT_CORE_RST_EN:
+        s->core_rst_en = value;
+        for (unsigned i = 0; i < 32; i++) {
+            qemu_set_irq(s->core_reset[i], (value >> i) & 1);
+        }
         break;
     case A_DPORT_APPCPU_RESET:
         old_state = s->appcpu_reset_state;
@@ -399,9 +410,12 @@ static void esp32_dport_reset_hold(Object *obj, ResetType type)
     s->perip_clk_en = 0xf9c1e06f;
     s->perip_rst_en = 0;
     s->wifi_clk_en = 0xfffce030;
+    s->core_rst_en = 0;
     for (unsigned i = 0; i < 32; i++) {
         qemu_set_irq(s->perip_reset[i], 0);
         qemu_set_irq(s->perip_clock[i], (s->perip_clk_en >> i) & 1);
+        qemu_set_irq(s->wifi_clock[i], (s->wifi_clk_en >> i) & 1);
+        qemu_set_irq(s->core_reset[i], 0);
     }
     esp32_cache_reset(&s->cache_state[0]);
     esp32_cache_reset(&s->cache_state[1]);
@@ -475,6 +489,10 @@ static void esp32_dport_init(Object *obj)
     qdev_init_gpio_out_named(DEVICE(sbd), &s->flash_dec_en_gpio, ESP32_DPORT_FLASH_DEC_EN_GPIO, 1);
     qdev_init_gpio_out_named(DEVICE(sbd), s->perip_clock, ESP32_DPORT_PERIP_CLOCK_GPIO, 32);
     qdev_init_gpio_out_named(DEVICE(sbd), s->perip_reset, ESP32_DPORT_PERIP_RESET_GPIO, 32);
+    qdev_init_gpio_out_named(DEVICE(sbd), s->wifi_clock,
+                             ESP32_DPORT_WIFI_CLOCK_GPIO, 32);
+    qdev_init_gpio_out_named(DEVICE(sbd), s->core_reset,
+                             ESP32_DPORT_CORE_RESET_GPIO, 32);
 }
 
 static Property esp32_dport_properties[] = {
@@ -493,19 +511,22 @@ static int dport_peripherals_post_load(void *opaque, int version)
     for (unsigned i = 0; i < 32; i++) {
         qemu_set_irq(s->perip_reset[i], (s->perip_rst_en >> i) & 1);
         qemu_set_irq(s->perip_clock[i], (s->perip_clk_en >> i) & 1);
+        qemu_set_irq(s->wifi_clock[i], (s->wifi_clk_en >> i) & 1);
+        qemu_set_irq(s->core_reset[i], (s->core_rst_en >> i) & 1);
     }
     return 0;
 }
 
 static const VMStateDescription vmstate_dport_peripherals = {
     .name = "misc.esp32.dport/peripheral-clock",
-    .version_id = 2,
+    .version_id = 3,
     .minimum_version_id = 1,
     .post_load = dport_peripherals_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32(perip_clk_en, Esp32DportState),
         VMSTATE_UINT32(perip_rst_en, Esp32DportState),
         VMSTATE_UINT32_V(wifi_clk_en, Esp32DportState, 2),
+        VMSTATE_UINT32_V(core_rst_en, Esp32DportState, 3),
         VMSTATE_END_OF_LIST()
     },
 };
