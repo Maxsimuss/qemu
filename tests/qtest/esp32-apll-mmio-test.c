@@ -33,6 +33,7 @@
 #define MUX 0x3ff49000
 #define I2S 0x3ff4f000
 #define WIFI_CLK_EN 0x3ff000cc
+#define CORE_RST_EN 0x3ff000d0
 #define WIFI_CLK_COMMON 0x000003c9
 #define WIFI_CLK_WIFI 0x00000406
 #define WIFI_CLK_RNG (1u << 15)
@@ -359,6 +360,9 @@ static void test_wifi_clock_enable_register(void)
     /* Writes are ordinary R/W, not sticky forced-enable bits. */
     qtest_writel(q, WIFI_CLK_EN, value & ~WIFI_CLK_BT);
     g_assert_cmphex(qtest_readl(q, WIFI_CLK_EN), ==, value & ~WIFI_CLK_BT);
+    g_assert_cmphex(qtest_readl(q, CORE_RST_EN), ==, 0);
+    qtest_writel(q, CORE_RST_EN, 0x5);
+    g_assert_cmphex(qtest_readl(q, CORE_RST_EN), ==, 0x5);
     finish(q, efuse_name);
 }
 
