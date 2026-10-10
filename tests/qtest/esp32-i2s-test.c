@@ -759,6 +759,80 @@ static void rx_analytic_dma_boundary(gconstpointer data)
     qtest_quit(b.q);
 }
 
+/* Full-duplex master clocks with DIN on a separate, stable physical pad can
+ * use the frame scheduler even though RX is not looped back from TX data. */
+static void rx_static_din_duplex(gconstpointer data)
+{
+    unsigned port = GPOINTER_TO_UINT(data);
+    TestBus b = setup(port, true, NULL);
+    unsigned rx_bck = port ? 164 : 27;
+    unsigned rx_ws = port ? 165 : 28;
+    unsigned rx_din = port ? 181 : 155;
+    unsigned din_pad = 22;
+
+    qtest_writel(b.q, GPIO + 0x130 + rx_bck * 4, CLK | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_ws * 4, WS | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_din * 4, din_pad | 128 | 64);
+    qtest_writel(b.q, MUX + 0x80, (2 << 12) | (1 << 9)); /* GPIO22 */
+    write_reg(&b, 0x00, 0x12345678);
+    qtest_writel(b.q, DESC, (1u << 31) | (1u << 30) | (4 << 12) | 4);
+    qtest_writel(b.q, DESC + 4, DATA);
+    qtest_writel(b.q, DESC + 8, 0);
+    write_reg(&b, 0x60, 1 << 12);
+    write_reg(&b, 0x24, 3);
+    write_reg(&b, 0x20, read_reg(&b, 0x20) | (1 << 12));
+    write_reg(&b, 0x34, (DESC & 0xfffff) | (1 << 29));
+    /* TX is master; RX follows its physical BCLK/WS route as a slave. */
+    write_reg(&b, 0x08, (1 << 4) | (1 << 5) | (1 << 7) | (1 << 18));
+
+    qtest_clock_step(b.q, 15748);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==,
+                    (1u << 31) | (1u << 30) | (4 << 12) | 4);
+    qtest_clock_step(b.q, 1);
+    qtest_clock_step(b.q, 1);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==,
+                    (4 << 12) | 4);
+    g_assert_cmphex(qtest_readl(b.q, DATA), ==, 0xffffffff);
+    qtest_quit(b.q);
+}
+
+static void rx_transition_din_duplex(gconstpointer data)
+{
+    unsigned port = GPOINTER_TO_UINT(data);
+    TestBus b = setup(port, true, NULL);
+    unsigned rx_bck = port ? 164 : 27;
+    unsigned rx_ws = port ? 165 : 28;
+    unsigned rx_din = port ? 181 : 155;
+    unsigned din_pad = 22;
+
+    qtest_writel(b.q, GPIO + 0x130 + rx_bck * 4, CLK | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_ws * 4, WS | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_din * 4, din_pad | 128);
+    qtest_writel(b.q, MUX + 0x80,
+                 (2 << 12) | (1 << 9) | (1 << 7)); /* GPIO22 */
+    write_reg(&b, 0x00, 0x12345678);
+    qtest_writel(b.q, DESC, (1u << 31) | (1u << 30) | (4 << 12) | 4);
+    qtest_writel(b.q, DESC + 4, DATA);
+    qtest_writel(b.q, DESC + 8, 0);
+    write_reg(&b, 0x60, 1 << 12);
+    write_reg(&b, 0x24, 3);
+    write_reg(&b, 0x20, read_reg(&b, 0x20) | (1 << 12));
+    write_reg(&b, 0x34, (DESC & 0xfffff) | (1 << 29));
+    write_reg(&b, 0x08, (1 << 4) | (1 << 5) | (1 << 7) | (1 << 18));
+
+    /* DIN starts low from the physical pull-down. 16 low samples precede
+     * this transition; the remaining 16 are high, giving 0x0000ffff. */
+    qtest_clock_step(b.q, 8000);
+    external(&b, din_pad, true);
+    qtest_clock_step(b.q, 7749);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==,
+                    (1u << 31) | (1u << 30) | (4 << 12) | 4);
+    qtest_clock_step(b.q, 1);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==, (4 << 12) | 4);
+    g_assert_cmphex(qtest_readl(b.q, DATA), ==, 0x0000ffff);
+    qtest_quit(b.q);
+}
+
 static void channel_selection(gconstpointer data)
 {
     TestBus b = setup(GPOINTER_TO_UINT(data), true, NULL);
@@ -905,10 +979,18 @@ int main(int argc, char **argv)
         g_autofree char *master = g_strdup_printf("/esp32/i2s%u/rx-master", port);
         g_autofree char *rxboundary = g_strdup_printf(
             "/esp32/i2s%u/rx-analytic-dma-boundary", port);
+        g_autofree char *rxstatic = g_strdup_printf(
+            "/esp32/i2s%u/rx-static-din-duplex", port);
+        g_autofree char *rxtransition = g_strdup_printf(
+            "/esp32/i2s%u/rx-transition-din-duplex", port);
         g_autofree char *channels = g_strdup_printf("/esp32/i2s%u/channel-selection", port);
         g_test_add_data_func(master, GUINT_TO_POINTER(port), receive_master);
         g_test_add_data_func(rxboundary, GUINT_TO_POINTER(port),
                              rx_analytic_dma_boundary);
+        g_test_add_data_func(rxstatic, GUINT_TO_POINTER(port),
+                             rx_static_din_duplex);
+        g_test_add_data_func(rxtransition, GUINT_TO_POINTER(port),
+                             rx_transition_din_duplex);
         g_test_add_data_func(channels, GUINT_TO_POINTER(port), channel_selection);
         g_autofree char *unmodeled = g_strdup_printf("/esp32/i2s%u/unmodeled-is-unknown", port);
         g_test_add_data_func(unmodeled, GUINT_TO_POINTER(port), unsupported_mode);

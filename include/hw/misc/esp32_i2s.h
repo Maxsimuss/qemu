@@ -27,6 +27,7 @@ typedef struct Esp32I2SChannel {
     uint32_t slot;
     uint32_t phase;
     uint32_t clock_bit;
+    uint32_t analytic_sample_progress;
     uint64_t clock_remainder;
     uint64_t analytic_frame_data;
     uint64_t analytic_frame_ws;
