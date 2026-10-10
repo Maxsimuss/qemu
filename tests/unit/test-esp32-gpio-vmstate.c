@@ -157,6 +157,38 @@ static void test_restore_active(void)
     virtual_time = 0;
 }
 
+static void test_analytic_input_uses_resolved_pad_for_direct_mux(void)
+{
+    Esp32GpioState gpio = { 0 };
+    const unsigned pad = 18;
+    const unsigned input_signal = 23;
+    const unsigned direct_output = 256;
+
+    memset(gpio.external, ESP32_PAD_Z, sizeof(gpio.external));
+    memset(gpio.external_resolved, ESP32_PAD_Z,
+           sizeof(gpio.external_resolved));
+    /* GPIO18 function 0 is a direct GPIO output, represented internally by
+     * signal 256.  Make its physical output high and route input 23 to it. */
+    gpio.mux[0x70 / 4] = 1 << 9; /* IOMUX input enable, function 0. */
+    gpio.regs[0x20 / 4] = 1 << pad; /* GPIO_ENABLE */
+    gpio.regs[0x04 / 4] = 1 << pad; /* GPIO_OUT */
+    gpio.regs[(0x130 + input_signal * 4) / 4] = pad | (1 << 7);
+    gpio.analytic_clock[direct_output] = true;
+    gpio.analytic_clock_num[direct_output] = 1;
+    gpio.analytic_clock_den[direct_output] = 1;
+    gpio.analytic_clock_origin[direct_output] = 0;
+
+    g_assert_false(esp32_gpio_output_feeds_input(&gpio, direct_output,
+                                                  input_signal));
+    /* The time-indexed sampler must not substitute an analytic signal for
+     * this pad.  The physical pad resolves high, while its input-matrix route
+     * is disconnected because the mux remains on function 0. */
+    g_assert_cmpuint(esp32_gpio_get_input_level_at(&gpio, input_signal, 0),
+                     ==, esp32_gpio_get_input_level(&gpio, input_signal));
+    g_assert_cmpuint(gpio.resolved[pad], ==, ESP32_PAD_HIGH);
+    g_assert_cmpuint(esp32_gpio_get_input_level(&gpio, input_signal), ==, 0);
+}
+
 static void test_restore_disabled(void)
 {
     Esp32GpioState source, dest;
@@ -216,6 +248,8 @@ int main(int argc, char **argv)
     init_clocks(NULL);
     qemu_clock_enable(QEMU_CLOCK_VIRTUAL, true);
     g_test_add_func("/esp32/gpio/vmstate/restore-active-rational-clkout", test_restore_active);
+    g_test_add_func("/esp32/gpio/analytic/direct-mux-physical-input",
+                    test_analytic_input_uses_resolved_pad_for_direct_mux);
     g_test_add_func("/esp32/gpio/vmstate/restore-disabled", test_restore_disabled);
     g_test_add_func("/esp32/gpio/vmstate/restore-version1", test_restore_version1);
     g_test_add_func("/esp32/gpio/vmstate/reject-invalid", test_reject_invalid);
