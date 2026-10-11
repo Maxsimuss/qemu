@@ -33,7 +33,7 @@
  * mirrors STATE_CTL); 0x69 (RO 0); 0x6A-0x6C (0x00); 0x70/0x71/0x72/0x73
  * faults (RO 0 except latched clock fault in 0x71 bit 2); 0x74-0x77 (0x00);
  * 0x78 FAULT_CLEAR (W, 0x80 clears clock fault). Unlisted book-0 offsets
- * are reserved (write ignored + guest error, read 0).
+ * are reserved (write ignored, read 0, warning on every access).
  *
  * DSP books: 0x8C pages 0x06 (GangEQ 0x5C, BypassEQ 0x60, vol L 0x64 /
  * vol R 0x68 9.23 default 1.0), 0x09 (mixer ltl 0x74, rtl 0x78,
@@ -1040,8 +1040,9 @@ static void reg_write(Esp32Tas5828m *s, uint8_t reg, uint8_t value)
     }
     if (s->cur_book == BOOK_CTRL && s->cur_page == 0x00) {
         if (ctrl_is_rsv(reg)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "esp32-tas5828m: write to reserved 0x%02x\n", reg);
+            warn_report("esp32-tas5828m I2C 0x%02x: write to unknown "
+                        "register %02x/%02x/%02x = 0x%02x (reserved)",
+                        s->address, s->cur_book, s->cur_page, reg, value);
             return;
         }
         if (ctrl_is_ro(reg)) {
@@ -1102,9 +1103,9 @@ static void reg_write(Esp32Tas5828m *s, uint8_t reg, uint8_t value)
     /* DSP book/registers: plain RAM with readback. */
     uint8_t *p = dsp_ptr(s, s->cur_book, s->cur_page, reg);
     if (!p) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "esp32-tas5828m: write to unmapped %02x/%02x/%02x\n",
-                      s->cur_book, s->cur_page, reg);
+        warn_report("esp32-tas5828m I2C 0x%02x: write to unknown "
+                    "register %02x/%02x/%02x = 0x%02x (unmapped)",
+                    s->address, s->cur_book, s->cur_page, reg, value);
         return;
     }
     *p = value;
@@ -1120,8 +1121,9 @@ static uint8_t reg_read(Esp32Tas5828m *s, uint8_t reg)
     }
     if (s->cur_book == BOOK_CTRL && s->cur_page == 0x00) {
         if (ctrl_is_rsv(reg)) {
-            qemu_log_mask(LOG_GUEST_ERROR,
-                          "esp32-tas5828m: read of reserved 0x%02x\n", reg);
+            warn_report("esp32-tas5828m I2C 0x%02x: read from unknown "
+                        "register %02x/%02x/%02x (reserved)",
+                        s->address, s->cur_book, s->cur_page, reg);
             return 0;
         }
         switch (reg) {
@@ -1166,9 +1168,9 @@ static uint8_t reg_read(Esp32Tas5828m *s, uint8_t reg)
     }
     uint8_t *p = dsp_ptr(s, s->cur_book, s->cur_page, reg);
     if (!p) {
-        qemu_log_mask(LOG_GUEST_ERROR,
-                      "esp32-tas5828m: read of unmapped %02x/%02x/%02x\n",
-                      s->cur_book, s->cur_page, reg);
+        warn_report("esp32-tas5828m I2C 0x%02x: read from unknown "
+                    "register %02x/%02x/%02x (unmapped)",
+                    s->address, s->cur_book, s->cur_page, reg);
         return 0;
     }
     return *p;
