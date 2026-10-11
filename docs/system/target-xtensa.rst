@@ -18,6 +18,12 @@ provided by the proprietary Tensilica ISS. It supports:
 
 -  Console and filesystem access via semihosting calls
 
+ESP32 operator guide
+--------------------
+
+For flash-backed ESP32 simulator runs, see
+:doc:`xtensa/esp32-simulator-operator`.
+
 The Avnet LX60/LX110/LX200 emulation supports:
 
 -  A range of Xtensa CPUs, default is the DC232B

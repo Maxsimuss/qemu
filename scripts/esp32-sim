@@ -1,0 +1,206 @@
+#!/usr/bin/env python3
+"""Start and control a persistent, flash-backed ESP32 QEMU run."""
+
+import argparse
+import json
+import os
+from pathlib import Path
+import shutil
+import socket
+import subprocess
+import sys
+import time
+
+
+ROOT = Path(__file__).resolve().parents[1]
+QEMU = Path(os.environ.get("QEMU_BIN", ROOT / "build/qemu-system-xtensa"))
+
+
+def qmp(run, command, arguments=None):
+    sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    sock.settimeout(5)
+    sock.connect(str(run / "qmp.sock"))
+    stream = sock.makefile("rwb", buffering=0)
+    stream.readline()  # greeting
+    stream.write(b'{"execute":"qmp_capabilities"}\r\n')
+
+    def reply():
+        while True:
+            item = json.loads(stream.readline())
+            if "return" in item or "error" in item:
+                return item
+
+    reply()
+    request = {"execute": command}
+    if arguments is not None:
+        request["arguments"] = arguments
+    stream.write(json.dumps(request).encode() + b"\r\n")
+    result = reply()
+    sock.close()
+    if "error" in result:
+        raise RuntimeError(result["error"])
+    return result["return"]
+
+
+def read_config(run):
+    path = run / "sim.json"
+    if not path.is_file():
+        raise SystemExit(f"No simulator run at {run}")
+    cfg = json.loads(path.read_text())
+    if cfg.get("preset", "generic") != "generic":
+        raise SystemExit("Board presets are no longer included; use a local "
+                         "board launcher or start a new run with --device")
+    cfg.setdefault("devices", [])
+    return cfg
+
+
+def alive(run):
+    if not (run / "qmp.sock").exists():
+        return False
+    try:
+        os.kill(int((run / "qemu.pid").read_text()), 0)
+        return True
+    except (FileNotFoundError, ProcessLookupError, ValueError):
+        return False
+
+
+def launch(run, cfg):
+    if not QEMU.is_file():
+        raise SystemExit(f"QEMU binary missing: {QEMU}")
+    run.mkdir(parents=True, exist_ok=True)
+    (run / "qmp.sock").unlink(missing_ok=True)
+    cfg["serial_log"] = str(run / f"serial-{time.time_ns()}.log")
+    (run / "sim.json").write_text(json.dumps(cfg, indent=2) + "\n")
+    args = [
+        str(QEMU), "-L", str(ROOT / "pc-bios"),
+        "-machine", ("esp32,wifi-peer-ssid=" + cfg["ssid"] +
+                     ",wifi-peer-password=" + cfg["password"]),
+        "-m", "4M", "-display", "none", "-monitor", "none",
+        "-serial", "file:" + cfg["serial_log"],
+        "-drive", f"file={run / 'flash.bin'},if=mtd,format=raw",
+        "-nic", ("user,id=wifi-slirp,model=misc.esp32_wifi,net=10.0.2.0/24,"
+                 "dhcpstart=10.0.2.15,hostfwd=tcp::" + str(cfg["port_15"]) +
+                 "-10.0.2.15:80,hostfwd=tcp::" + str(cfg["port_16"]) +
+                 "-10.0.2.16:80"),
+        "-qmp", f"unix:{run / 'qmp.sock'},server=on,wait=off",
+        "-icount", "shift=2,align=off,sleep=off",
+    ]
+    for device in cfg["devices"]:
+        args.extend(["-device", device])
+    if cfg["pins"]:
+        args.extend(["-global", "driver=esp32.gpio,property=pin-trace,value=" + cfg["pins"]])
+    with (run / "qemu.log").open("ab") as log:
+        proc = subprocess.Popen(args, stdin=subprocess.DEVNULL,
+                                stdout=log, stderr=subprocess.STDOUT,
+                                start_new_session=True)
+    (run / "qemu.pid").write_text(str(proc.pid) + "\n")
+    deadline = time.monotonic() + 10
+    while time.monotonic() < deadline:
+        if proc.poll() is not None:
+            raise SystemExit(f"QEMU exited; inspect {run / 'qemu.log'}")
+        if (run / "qmp.sock").exists():
+            return proc.pid
+        time.sleep(0.1)
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        proc.wait()
+    (run / "qemu.pid").unlink(missing_ok=True)
+    raise SystemExit(f"QMP did not start; inspect {run / 'qemu.log'}")
+
+
+def report(run):
+    cfg = read_config(run)
+    print(f"run: {run}")
+    print(f"pid: {(run / 'qemu.pid').read_text().strip() if alive(run) else 'stopped'}")
+    if alive(run):
+        print(f"QMP status: {qmp(run, 'query-status')}")
+    print(f"10.0.2.15 forward: http://127.0.0.1:{cfg['port_15']}/")
+    print(f"10.0.2.16 forward: http://127.0.0.1:{cfg['port_16']}/")
+    print(f"QMP: {run / 'qmp.sock'}")
+    print(f"logs: {run / 'qemu.log'}, {cfg['serial_log']}")
+    for device in cfg["devices"]:
+        print(f"device: {device}")
+    if cfg["pins"]:
+        print(f"pin trace: {cfg['pins']}")
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    sub = parser.add_subparsers(dest="action", required=True)
+    start = sub.add_parser("start", help="copy flash and start a new run")
+    start.add_argument("flash", type=Path, help="input raw flash image")
+    start.add_argument("run_dir", type=Path)
+    start.add_argument("--peer-ssid", default="test-ap")
+    start.add_argument("--peer-password", default="test-password")
+    start.add_argument("--port-15", type=int, default=18080,
+                       help="host TCP port forwarded to SLIRP 10.0.2.15:80")
+    start.add_argument("--port-16", type=int, default=18081,
+                       help="host TCP port forwarded to SLIRP 10.0.2.16:80")
+    start.add_argument("--pins", help="optional GPIO VCD output path")
+    start.add_argument("--device", action="append", default=[],
+                       help="QEMU device specification; repeat to attach more devices")
+    command_help = {
+        "status": "show process, QMP state, forwards, and output paths",
+        "stop": "gracefully quit QEMU and keep the writable flash",
+        "reset": "reset the guest through QMP",
+        "restart": "quit and relaunch using the same writable flash",
+    }
+    for action, help_text in command_help.items():
+        cmd = sub.add_parser(action, help=help_text)
+        cmd.add_argument("run_dir", type=Path)
+    args = parser.parse_args()
+    run = args.run_dir.resolve()
+    if args.action == "start":
+        if not args.flash.is_file() or args.flash.stat().st_size != 4 * 1024 * 1024:
+            raise SystemExit(f"Flash image must be a 4 MiB raw image: {args.flash}")
+        if run.exists() and (not run.is_dir() or any(run.iterdir())):
+            raise SystemExit(f"Run directory is not empty; refusing to overwrite it: {run}")
+        if args.port_15 == args.port_16 or not (1 <= args.port_15 <= 65535 and
+                                                 1 <= args.port_16 <= 65535):
+            raise SystemExit("Choose two distinct TCP ports from 1 to 65535")
+        if any("," in value for value in (args.peer_ssid, args.peer_password)):
+            raise SystemExit("Peer SSID/password cannot contain commas")
+        run.mkdir(parents=True, exist_ok=True)
+        shutil.copyfile(args.flash, run / "flash.bin")
+        cfg = {"ssid": args.peer_ssid, "password": args.peer_password,
+               "port_15": args.port_15, "port_16": args.port_16,
+               "pins": str(Path(args.pins).resolve()) if args.pins else None,
+               "devices": args.device}
+        if cfg["pins"]:
+            Path(cfg["pins"]).parent.mkdir(parents=True, exist_ok=True)
+        (run / "sim.json").write_text(json.dumps(cfg, indent=2) + "\n")
+        launch(run, cfg)
+    elif args.action == "status":
+        report(run)
+        return
+    elif args.action == "reset":
+        print(qmp(run, "system_reset"))
+    elif args.action == "stop":
+        if alive(run):
+            qmp(run, "quit")
+            deadline = time.monotonic() + 10
+            while alive(run) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if alive(run):
+                raise SystemExit("QEMU did not stop after QMP quit")
+    elif args.action == "restart":
+        if alive(run):
+            qmp(run, "quit")
+            deadline = time.monotonic() + 10
+            while alive(run) and time.monotonic() < deadline:
+                time.sleep(0.1)
+            if alive(run):
+                raise SystemExit("QEMU did not stop after QMP quit")
+        launch(run, read_config(run))
+    report(run)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except (OSError, RuntimeError, json.JSONDecodeError) as exc:
+        print(f"esp32-sim: {exc}", file=sys.stderr)
+        raise SystemExit(1)
