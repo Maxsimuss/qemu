@@ -2,10 +2,6 @@
 QEMU README
 ===========
 
-.. warning::
-
-   This fork is fully vibe coded. **Do not use it for anything.**
-
 QEMU is a generic and open source machine & userspace emulator and
 virtualizer.
 
