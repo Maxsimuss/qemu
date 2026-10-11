@@ -441,6 +441,27 @@ static void bringup_books(void)
     dut_end(&d);
 }
 
+/* Book selection is confined to page 0; 0x7f is RAM on DSP pages. */
+static void book_selector_page_scope(void)
+{
+    static const uint8_t books[] = {0x78, 0x8C, 0xAA};
+    static const uint8_t pages[] = {6, 1, 1};
+    Dut d = dut_start(NULL);
+
+    for (unsigned i = 0; i < ARRAY_SIZE(books); i++) {
+        set_book_page(d.q, books[i], pages[i]);
+        g_assert_cmphex(tas_get(d.q, 0x00), ==, pages[i]);
+        tas_set(d.q, 0x7F, 0xA5);
+        g_assert_cmphex(tas_get(d.q, 0x7F), ==, 0xA5);
+        g_assert_cmphex(tas_get(d.q, 0x00), ==, pages[i]);
+        tas_set(d.q, 0x00, 0);
+        g_assert_cmphex(tas_get(d.q, 0x7F), ==, books[i]);
+        tas_set(d.q, 0x7F, 0);
+        g_assert_cmphex(tas_get(d.q, 0x7F), ==, 0);
+    }
+    dut_end(&d);
+}
+
 static void reset_modes(void)
 {
     Dut d = dut_start(NULL);
@@ -716,6 +737,8 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
     qtest_add_func("/esp32/tas5828m/bringup-books", bringup_books);
     qtest_add_func("/esp32/tas5828m/reset-modes", reset_modes);
+    qtest_add_func("/esp32/tas5828m/book-selector-page-scope",
+                   book_selector_page_scope);
     qtest_add_func("/esp32/tas5828m/coefficient-safety-checks",
                    coefficient_safety_checks);
     qtest_add_func("/esp32/tas5828m/no-pullups-float-low", no_pullups_float_low);

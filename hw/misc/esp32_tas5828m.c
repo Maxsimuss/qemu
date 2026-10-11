@@ -1033,7 +1033,7 @@ static void reg_write(Esp32Tas5828m *s, uint8_t reg, uint8_t value)
         s->cur_page = value;
         return;
     }
-    if (pointed && reg == R_SET_BOOK) {
+    if (pointed && reg == R_SET_BOOK && s->cur_page == 0) {
         s->cur_book = value;
         s->cur_page = 0x00;
         return;

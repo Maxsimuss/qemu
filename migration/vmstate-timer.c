@@ -59,5 +59,3 @@ const VMStateInfo vmstate_info_timer = {
     .get  = get_timer,
     .put  = put_timer,
 };
-
-
