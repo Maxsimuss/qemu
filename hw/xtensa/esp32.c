@@ -1051,6 +1051,12 @@ static void esp32_machine_init_wifi(Esp32SocState *ss, Esp32MachineState *ms)
                                     qdev_get_gpio_in_named(wifi,
                                         ESP32_WIFI_RESET_GPIO, bit));
     }
+    for (unsigned bit = 0; bit < ESP32_WIFI_RFPLL_TUNE_GPIO_COUNT; bit++) {
+        qdev_connect_gpio_out_named(wifi, ESP32_WIFI_RFPLL_TUNE_GPIO, bit,
+                                    qdev_get_gpio_in_named(
+                                        DEVICE(&ss->rtc_cntl),
+                                        ESP32_RTC_RFPLL_TUNE_GPIO, bit));
+    }
     sysbus_connect_irq(sbd, 0,
                        qdev_get_gpio_in(DEVICE(&ss->intmatrix), ETS_WIFI_MAC_INTR_SOURCE));
     memory_region_add_subregion(sys_mem, DR_REG_WIFI_BASE,
@@ -1061,6 +1067,69 @@ static void esp32_machine_init_wifi(Esp32SocState *ss, Esp32MachineState *ms)
                              sysbus_mmio_get_region(sbd, 0), 0,
                              ESP32_WIFI_MMIO_SIZE);
     memory_region_add_subregion_overlap(sys_mem, 0x60033000, wifi_apb, 0);
+
+    /* Reverse-engineered Wi-Fi RX-control registers occupy a private block
+     * in the TRM-reserved range.  Map only the block's observed callbacks;
+     * the device rejects unknown offsets rather than emulating flat RAM. */
+    memory_region_add_subregion(sys_mem, ESP32_WIFI_RXCTRL_BASE,
+                                 sysbus_mmio_get_region(sbd, 1));
+    MemoryRegion *wifi_rxctrl_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_rxctrl_apb, OBJECT(wifi),
+                             "esp32.wifi-rxctrl-apb",
+                             sysbus_mmio_get_region(sbd, 1), 0,
+                             ESP32_WIFI_RXCTRL_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x6001c000,
+                                         wifi_rxctrl_apb, 0);
+
+    /* IDF's FE/FE2 bases are public; only the sparse PHY-observed registers
+     * are implemented, and unknown offsets remain rejected. */
+    memory_region_add_subregion(sys_mem, ESP32_WIFI_FE_BASE,
+                                 sysbus_mmio_get_region(sbd, 2));
+    memory_region_add_subregion(sys_mem, ESP32_WIFI_FE2_BASE,
+                                 sysbus_mmio_get_region(sbd, 3));
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_TXDC_PBUS_BASE,
+                                         sysbus_mmio_get_region(sbd, 4), 1);
+    MemoryRegion *wifi_txdc_pbus_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_txdc_pbus_apb, OBJECT(wifi),
+                             "esp32-txdc-pbus-apb",
+                             sysbus_mmio_get_region(sbd, 4), 0, 4);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_TXDC_PBUS_APB,
+                                         wifi_txdc_pbus_apb, 1);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_RFPLL_FREQ_BASE,
+                                         sysbus_mmio_get_region(sbd, 5), 1);
+    MemoryRegion *wifi_rfpll_freq_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_rfpll_freq_apb, OBJECT(wifi),
+                             "esp32-wifi-rfpll-frequency-apb",
+                             sysbus_mmio_get_region(sbd, 5), 0, 4);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_RFPLL_FREQ_APB,
+                                         wifi_rfpll_freq_apb, 1);
+    memory_region_add_subregion_overlap(sys_mem, ESP32_WIFI_PHY_BT_IFS_ADDR,
+                                         sysbus_mmio_get_region(sbd, 6), 1);
+    /* coex_bt_high_prio() in the supplied PHY ELF touches five words in a
+     * private APB range that overlaps the Wi-Fi APB aperture. Map only the
+     * observed singleton words; do not shadow the intervening Wi-Fi window. */
+    static const hwaddr wifi_coex_apb[] = {
+        ESP32_WIFI_COEX_APB_BASE,
+        ESP32_WIFI_COEX_APB_BASE + 0x230,
+        ESP32_WIFI_COEX_APB_BASE + 0x2c60,
+        ESP32_WIFI_COEX_APB_BASE + 0x2c68,
+        ESP32_WIFI_COEX_APB_BASE + 0x2c70,
+    };
+    for (unsigned i = 0; i < ARRAY_SIZE(wifi_coex_apb); i++) {
+        memory_region_add_subregion_overlap(sys_mem, wifi_coex_apb[i],
+                                             sysbus_mmio_get_region(sbd,
+                                                 7 + i), 1);
+    }
+    MemoryRegion *wifi_fe_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_fe_apb, OBJECT(wifi), "esp32.fe-apb",
+                             sysbus_mmio_get_region(sbd, 2), 0,
+                             ESP32_WIFI_FE_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x60006000, wifi_fe_apb, 0);
+    MemoryRegion *wifi_fe2_apb = g_new(MemoryRegion, 1);
+    memory_region_init_alias(wifi_fe2_apb, OBJECT(wifi), "esp32.fe2-apb",
+                             sysbus_mmio_get_region(sbd, 3), 0,
+                             ESP32_WIFI_FE2_SIZE);
+    memory_region_add_subregion_overlap(sys_mem, 0x60005000, wifi_fe2_apb, 0);
 }
 
 static void esp32_machine_init_openeth(Esp32SocState *ss)

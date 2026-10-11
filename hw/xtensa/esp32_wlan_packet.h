@@ -44,14 +44,18 @@ struct mac80211_frame *Esp32_WLAN_create_probe_request(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_authentication_request(void);
 struct mac80211_frame *Esp32_WLAN_create_authentication_response(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_deauthentication(void);
+struct mac80211_frame *Esp32_WLAN_create_deauthentication_reason(
+    uint16_t reason);
 struct mac80211_frame *Esp32_WLAN_create_association_request(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_association_response(access_point_info *ap);
 struct mac80211_frame *Esp32_WLAN_create_disassociation(void);
 struct mac80211_frame *Esp32_WLAN_create_data_reply(Esp32WifiState *s, struct mac80211_frame *incoming);
 struct mac80211_frame *Esp32_WLAN_create_data_packet(Esp32WifiState *s, const uint8_t *buf, int size);
 struct mac80211_frame *Esp32_WLAN_create_ack(void);
-struct mac80211_frame *Esp32_WLAN_create_dhcp_discover(void);
-struct mac80211_frame *Esp32_WLAN_create_dhcp_request(uint8_t *ip);
+struct mac80211_frame *Esp32_WLAN_create_dhcp_discover(
+    const uint8_t client_mac[6], const uint8_t xid[4]);
+struct mac80211_frame *Esp32_WLAN_create_dhcp_request(const dhcp_t *offer,
+                                                      const uint8_t server_id[4]);
 void insertCRC(mac80211_frame *frame);
 
 #endif // esp32_wlan_packet_h

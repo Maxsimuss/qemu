@@ -2,20 +2,50 @@
 /* WPA2 peer key derivation and CCMP data protection tests. */
 #include "qemu/osdep.h"
 #include "crypto/init.h"
+#include "qemu/bswap.h"
 #include "crypto/hmac.h"
 #include "crypto/pbkdf.h"
 #include "hw/xtensa/esp32_wifi_security.h"
+
+static void key_record_set(uint8_t record[40], const uint8_t peer[6],
+                           uint8_t interface_id, uint8_t cipher,
+                           const uint8_t key[16]);
+static void key_record_set_group(uint8_t record[40], unsigned key_id);
 
 static const uint8_t test_rsn_ie[] = {
     48,20,1,0, 0,0x0f,0xac,4, 1,0, 0,0x0f,0xac,4,
     1,0, 0,0x0f,0xac,2, 0,0
 };
 
+static void make_test_assoc_body(mac80211_frame *frame,
+                                 const uint8_t *rsn, size_t rsn_len)
+{
+    static const uint8_t fixed[] = {0x31,4,3,0};
+    static const uint8_t ssid[] = {0,7,'t','e','s','t','-','a','p'};
+    static const uint8_t rates[] = {1,8,0x8b,0x96,0x82,0x84,
+                                    0x0c,0x18,0x30,0x60};
+    static const uint8_t ext_rates[] = {50,4,0x6c,0x12,0x24,0x48};
+    size_t pos = 0;
+
+    memcpy(frame->data_and_fcs + pos, fixed, sizeof(fixed));
+    pos += sizeof(fixed);
+    memcpy(frame->data_and_fcs + pos, ssid, sizeof(ssid));
+    pos += sizeof(ssid);
+    memcpy(frame->data_and_fcs + pos, rates, sizeof(rates));
+    pos += sizeof(rates);
+    memcpy(frame->data_and_fcs + pos, rsn, rsn_len);
+    pos += rsn_len;
+    memcpy(frame->data_and_fcs + pos, ext_rates, sizeof(ext_rates));
+    pos += sizeof(ext_rates);
+    /* The real RX wire-length contract includes an FCS after the body. */
+    frame->frame_length = IEEE80211_HEADER_SIZE + pos + 4;
+}
+
 static void derive_test_ptk(const uint8_t pmk[32], const uint8_t ap[6],
                             const uint8_t sta[6], const uint8_t anonce[32],
                             const uint8_t snonce[32], uint8_t ptk[64])
 {
-    uint8_t input[101], context[76], digest[20];
+    uint8_t input[100], context[76], digest[20];
     size_t copied = 0;
     Error *err = NULL;
     QCryptoHmac *h;
@@ -30,14 +60,14 @@ static void derive_test_ptk(const uint8_t pmk[32], const uint8_t ap[6],
     } else {
         memcpy(context + 12, snonce, 32); memcpy(context + 44, anonce, 32);
     }
-    memcpy(input, "Pairwise key expansion", 23);
-    input[23] = 0; memcpy(input + 24, context, sizeof(context));
+    memcpy(input, "Pairwise key expansion", 22);
+    input[22] = 0; memcpy(input + 23, context, sizeof(context));
     h = qcrypto_hmac_new(QCRYPTO_HASH_ALGO_SHA1, pmk, 32, &err);
     g_assert_null(err);
     for (uint8_t i = 0; copied < 64; i++) {
         uint8_t *out = digest;
         size_t nout = sizeof(digest);
-        input[100] = i;
+        input[99] = i;
         g_assert_cmpint(qcrypto_hmac_bytes(h, (char *)input, sizeof(input),
                                             &out, &nout, &err), ==, 0);
         g_assert_null(err);
@@ -89,7 +119,10 @@ static mac80211_frame *make_station_key(const uint8_t sta[6],
 
     f->frame_control.type = IEEE80211_TYPE_DATA;
     f->frame_control.to_ds = 1;
+    memcpy(f->receiver_address,
+           (uint8_t[]){0x10,1,0,0xc4,0x0a,0x51}, 6);
     memcpy(f->transmitter_address, sta, 6);
+    memcpy(f->address_3, (uint8_t[]){0x10,1,0,0xc4,0x0a,0x51}, 6);
     memcpy(d, (uint8_t[]){0xaa,0xaa,3,0,0,0,0x88,0x8e}, 8);
     /* IDF's stock RSN supplicant uses EAPOL protocol version 1. */
     e[0] = 1; e[1] = 3; e[2] = (eapol_len - 4) >> 8;
@@ -142,17 +175,53 @@ static void test_ccmp_roundtrip_and_mic_reject(void)
     f->frame_length = IEEE80211_HEADER_SIZE + sizeof(payload);
     length = f->frame_length;
 
-    g_assert_true(esp32_wpa2_encrypt_data(&tx, f));
+    /* QoS CCMP needs QoS-control AAD and per-TID replay state. Until those
+     * semantics are implemented, reject it instead of treating it as plain
+     * data with a weaker AAD. */
+    f->frame_control.sub_type = 8;
+    g_assert_false(esp32_wpa2_encrypt_data(&tx, f, tx.ptk + 32));
+    g_assert_cmpuint(tx.tx_pn, ==, 0);
+    f->frame_control.sub_type = 0;
+
+    g_assert_true(esp32_wpa2_encrypt_data(&tx, f, tx.ptk + 32));
     g_assert_cmpuint(f->frame_length, ==, length + 16);
     g_assert_true(((uint8_t *)f)[1] & 0x40);
-    g_assert_true(esp32_wpa2_decrypt_data(&rx, f));
+    f->frame_control.sub_type = 8;
+    uint64_t rx_pn = rx.rx_pn;
+    g_assert_false(esp32_wpa2_decrypt_data(&rx, f, rx.ptk + 32));
+    g_assert_cmpuint(rx.rx_pn, ==, rx_pn);
+    f->frame_control.sub_type = 0;
+    g_assert_true(esp32_wpa2_decrypt_data(&rx, f, rx.ptk + 32));
     g_assert_cmpuint(f->frame_length, ==, length);
     g_assert_cmpmem(f->data_and_fcs, sizeof(payload), payload, sizeof(payload));
     g_assert_false(((uint8_t *)f)[1] & 0x40);
 
-    g_assert_true(esp32_wpa2_encrypt_data(&tx, f));
+    g_assert_true(esp32_wpa2_encrypt_data(&tx, f, tx.ptk + 32));
     f->data_and_fcs[f->frame_length - IEEE80211_HEADER_SIZE - 1] ^= 0x80;
-    g_assert_false(esp32_wpa2_decrypt_data(&rx, f));
+    uint64_t last_pn = rx.rx_pn;
+    g_assert_false(esp32_wpa2_decrypt_data(&rx, f, rx.ptk + 32));
+    g_assert_cmpuint(rx.rx_pn, ==, last_pn);
+    g_free(f);
+}
+
+static void test_ccmp_packet_number_exhaustion(void)
+{
+    Esp32Wpa2Peer tx = {.keys_installed = true};
+    mac80211_frame *f = g_malloc0(sizeof(*f));
+    const uint8_t payload[] = {0xaa,0xaa,3,0,0,0,8,0};
+
+    memset(tx.ptk + 32, 0x42, 16);
+    f->frame_control.type = IEEE80211_TYPE_DATA;
+    memcpy(f->receiver_address, (uint8_t[]){0,1,2,3,4,5}, 6);
+    memcpy(f->data_and_fcs, payload, sizeof(payload));
+    f->frame_length = IEEE80211_HEADER_SIZE + sizeof(payload);
+    tx.tx_pn = G_GUINT64_CONSTANT(0xffffffffffff) - 1;
+    g_assert_true(esp32_wpa2_encrypt_data(&tx, f, tx.ptk + 32));
+    g_assert_cmpuint(tx.tx_pn, ==, G_GUINT64_CONSTANT(0xffffffffffff));
+    size_t encrypted_length = f->frame_length;
+    g_assert_false(esp32_wpa2_encrypt_data(&tx, f, tx.ptk + 32));
+    g_assert_cmpuint(tx.tx_pn, ==, G_GUINT64_CONSTANT(0xffffffffffff));
+    g_assert_cmpuint(f->frame_length, ==, encrypted_length);
     g_free(f);
 }
 
@@ -182,16 +251,47 @@ static void test_ccmp_ieee_reference_vector(void)
         0xb6,0x2f,0xb6,0xcd,0xa8,0xeb,0x7e,0x78,0xa0,0x50
     };
     const uint64_t pn = G_GUINT64_CONSTANT(0xb5039776e70c);
-    Esp32Wpa2Peer rx = {.keys_installed = true, .rx_pn = pn - 1};
-    Esp32Wpa2Peer tx = {.keys_installed = true, .tx_pn = pn - 1};
+    uint8_t table[32][40] = { 0 }, wrong_key[16];
+    Esp32WifiKey selected;
+    uint32_t valid = 1;
+    uint64_t last_pn = pn - 1;
+    Esp32Wpa2Peer rx = {
+        .keys_installed = true,
+        .group_rx_pn = pn - 1,
+    };
+    Esp32Wpa2Peer tx = {
+        .keys_installed = true,
+        .group_tx_pn = pn - 1,
+    };
     mac80211_frame *f = g_malloc0(sizeof(*f));
 
-    memcpy(rx.ptk, key, sizeof(key));
-    memcpy(tx.ptk, key, sizeof(key));
+    memcpy(rx.gtk, key, sizeof(key));
+    memcpy(tx.gtk, key, sizeof(key));
+    memset(wrong_key, 0x3c, sizeof(wrong_key));
+    key_record_set(table[0], hdr + 4, 0, ESP32_WIFI_KEY_CIPHER_CCMP, wrong_key);
+    key_record_set_group(table[0], 0);
     memcpy(f, hdr, sizeof(hdr));
     memcpy(f->data_and_fcs, ccmp, sizeof(ccmp));
     f->frame_length = IEEE80211_HEADER_SIZE + sizeof(ccmp);
-    g_assert_true(esp32_wpa2_decrypt_data(&rx, f));
+    g_assert_true(esp32_wifi_key_lookup(table, valid, 0, ESP32_WIFI_KEY_CIPHER_CCMP, hdr + 4, 0,
+                                        &selected));
+    g_assert_false(esp32_ccmp_decrypt(f, selected.bytes, &last_pn));
+    g_assert_cmpuint(last_pn, ==, pn - 1);
+
+    key_record_set(table[0], hdr + 4, 0, ESP32_WIFI_KEY_CIPHER_CCMP, key);
+    key_record_set_group(table[0], 0);
+    g_assert_true(esp32_wifi_key_lookup(table, valid, 0, ESP32_WIFI_KEY_CIPHER_CCMP, hdr + 4, 0,
+                                        &selected));
+    g_assert_true(esp32_ccmp_decrypt(f, selected.bytes, &last_pn));
+    g_assert_cmpuint(last_pn, ==, pn);
+    g_assert_cmpmem(f->data_and_fcs, sizeof(plain), plain, sizeof(plain));
+
+    last_pn = pn - 1;
+    memcpy(f, hdr, sizeof(hdr));
+    memcpy(f->data_and_fcs, ccmp, sizeof(ccmp));
+    f->frame_length = IEEE80211_HEADER_SIZE + sizeof(ccmp);
+    g_assert_true(esp32_wpa2_decrypt_data(
+        &rx, f, esp32_wpa2_expected_data_key(&rx, f->receiver_address)));
     g_assert_cmpmem(f->data_and_fcs, sizeof(plain), plain, sizeof(plain));
 
     /* The already accepted packet number is rejected even when its
@@ -199,13 +299,26 @@ static void test_ccmp_ieee_reference_vector(void)
     memcpy(f, hdr, sizeof(hdr));
     memcpy(f->data_and_fcs, ccmp, sizeof(ccmp));
     f->frame_length = IEEE80211_HEADER_SIZE + sizeof(ccmp);
-    g_assert_false(esp32_wpa2_decrypt_data(&rx, f));
+    g_assert_false(esp32_wpa2_decrypt_data(
+        &rx, f, esp32_wpa2_expected_data_key(&rx, f->receiver_address)));
 
     memcpy(f, hdr, sizeof(hdr));
     memcpy(f->data_and_fcs, plain, sizeof(plain));
     f->frame_length = IEEE80211_HEADER_SIZE + sizeof(plain);
-    g_assert_true(esp32_wpa2_encrypt_data(&tx, f));
+    g_assert_true(esp32_wpa2_encrypt_data(
+        &tx, f, esp32_wpa2_expected_data_key(&tx, f->receiver_address)));
     g_assert_cmpmem(f->data_and_fcs, sizeof(ccmp), ccmp, sizeof(ccmp));
+
+    /* CCMP KeyID occupies the high two bits of octet 3 and must survive the
+     * transform independently of the selected group-key table slot. */
+    memcpy(f, hdr, sizeof(hdr));
+    memcpy(f->data_and_fcs, plain, sizeof(plain));
+    f->frame_length = IEEE80211_HEADER_SIZE + sizeof(plain);
+    uint64_t tx_pn = pn - 1, rx_pn = pn - 1;
+    g_assert_true(esp32_ccmp_encrypt(f, key, 3, &tx_pn));
+    g_assert_cmpuint((f->data_and_fcs[3] >> 6) & 3, ==, 3);
+    g_assert_true(esp32_ccmp_decrypt(f, key, &rx_pn));
+    g_assert_cmpmem(f->data_and_fcs, sizeof(plain), plain, sizeof(plain));
     g_free(f);
 }
 
@@ -215,7 +328,7 @@ static void test_wpa2_four_way_handshake(void)
     const uint8_t sta[6] = {0x24,0x6f,0x28,0x11,0x22,0x33};
     Esp32Wpa2Peer ap;
     mac80211_frame *assoc = g_malloc0(sizeof(*assoc));
-    mac80211_frame *response, *m1, *m2, *m3, *m4;
+    mac80211_frame *response, *m1, *m2, *m3, *m3_retry, *m4;
     uint8_t snonce[32], ptk[64];
     uint8_t wrong_pmk[32], wrong_ptk[64];
     uint8_t *e;
@@ -229,9 +342,7 @@ static void test_wpa2_four_way_handshake(void)
     assoc->frame_control.type = IEEE80211_TYPE_MGT;
     assoc->frame_control.sub_type = IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ;
     memcpy(assoc->transmitter_address, sta, 6);
-    memcpy(assoc->data_and_fcs, (uint8_t[]){0x31,4,3,0}, 4);
-    memcpy(assoc->data_and_fcs + 4, test_rsn_ie, ielen);
-    assoc->frame_length = IEEE80211_HEADER_SIZE + 4 + ielen;
+    make_test_assoc_body(assoc, test_rsn_ie, ielen);
     g_assert_true(esp32_wpa2_assoc_request(&ap, assoc));
     response = esp32_wpa2_assoc_response(&ap);
     g_assert_nonnull(response);
@@ -283,12 +394,34 @@ static void test_wpa2_four_way_handshake(void)
     g_assert_null(esp32_wpa2_rx_eapol(&ap, bad_m2));
     g_assert_false(ap.m3_sent);
     g_free(bad_m2);
+    bad_m2 = make_station_key(sta, 0x010a, 0, snonce, test_rsn_ie,
+                              sizeof(test_rsn_ie), ptk);
+    g_assert_null(esp32_wpa2_rx_eapol(&ap, bad_m2));
+    g_assert_false(ap.m3_sent);
+    g_free(bad_m2);
+    bad_m2 = make_station_key((uint8_t[]){0x24,0x6f,0x28,0x11,0x22,0x34},
+                              0x010a, 1, snonce, test_rsn_ie,
+                              sizeof(test_rsn_ie), ptk);
+    g_assert_null(esp32_wpa2_rx_eapol(&ap, bad_m2));
+    g_assert_false(ap.m3_sent);
+    g_free(bad_m2);
     m3 = esp32_wpa2_rx_eapol(&ap, m2);
     g_assert_nonnull(m3);
     e = m3->data_and_fcs + 8;
     g_assert_cmphex((e[5] << 8) | e[6], ==, 0x13ca);
-    g_assert_cmpuint((e[97] << 8) | e[98], ==, 32);
+    g_assert_cmpuint((e[97] << 8) | e[98], ==, 56);
     g_assert_false(ap.keys_installed);
+
+    /* A lost M3 causes the station to repeat its original M2. The peer must
+     * resend identical key data at the same replay counter. */
+    m3_retry = esp32_wpa2_rx_eapol(&ap, m2);
+    g_assert_nonnull(m3_retry);
+    g_assert_cmpuint(m3_retry->frame_length, ==, m3->frame_length);
+    g_assert_cmpmem(m3_retry->data_and_fcs,
+                    m3->frame_length - IEEE80211_HEADER_SIZE,
+                    m3->data_and_fcs,
+                    m3->frame_length - IEEE80211_HEADER_SIZE);
+    g_free(m3_retry);
 
     bad_m4 = make_station_key(sta, 0x010a, 2, NULL, NULL, 0, ptk);
     g_assert_null(esp32_wpa2_rx_eapol(&ap, bad_m4));
@@ -298,6 +431,14 @@ static void test_wpa2_four_way_handshake(void)
     set_test_eapol_version(m4, 2, ptk); /* hostapd-style header */
     g_assert_null(esp32_wpa2_rx_eapol(&ap, m4));
     g_assert_true(ap.keys_installed);
+    g_assert_cmpmem(ap.ptk + 32, 16, ptk + 32, 16);
+    g_assert_cmpmem(ap.ptk, 16, ptk, 16);
+    g_assert_cmpmem(ap.ptk + 16, 16, ptk + 16, 16);
+    g_assert_true(esp32_wpa2_expected_data_key(&ap, (uint8_t[]){2,0,0,0,0,0}) ==
+                  ap.ptk + 32);
+    g_assert_true(esp32_wpa2_expected_data_key(&ap,
+                                               (uint8_t[]){0xff,0,0,0,0,0}) ==
+                  ap.gtk);
     g_free(assoc); g_free(m1); g_free(m2); g_free(m3); g_free(m4);
 }
 
@@ -317,16 +458,125 @@ static void test_rsn_suite_selection(void)
     assoc->frame_control.type = IEEE80211_TYPE_MGT;
     assoc->frame_control.sub_type = IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_REQ;
     memcpy(assoc->transmitter_address, (uint8_t[]){2,3,4,5,6,7}, 6);
-    memcpy(assoc->data_and_fcs, (uint8_t[]){0x31,4,3,0}, 4);
-    memcpy(assoc->data_and_fcs + 4, rsn_multi, sizeof(rsn_multi));
-    assoc->frame_length = IEEE80211_HEADER_SIZE + 4 + sizeof(rsn_multi);
+    make_test_assoc_body(assoc, rsn_multi, sizeof(rsn_multi));
     g_assert_true(esp32_wpa2_assoc_request(&ap, assoc));
 
     /* A group TKIP offer cannot be silently accepted as the configured
      * CCMP-only peer. */
-    assoc->data_and_fcs[4 + 4 + 3] = 2;
+    assoc->data_and_fcs[4 + 9 + 10 + 4 + 3] = 2;
     g_assert_false(esp32_wpa2_assoc_request(&ap, assoc));
     g_free(assoc);
+}
+
+static void key_record_set(uint8_t record[40], const uint8_t peer[6],
+                           uint8_t interface_id, uint8_t cipher,
+                           const uint8_t key[16])
+{
+    uint32_t word0 = peer[0] | (uint32_t)peer[1] << 8 |
+                     (uint32_t)peer[2] << 16 | (uint32_t)peer[3] << 24;
+    uint32_t word1 = peer[4] | (uint32_t)peer[5] << 8 |
+                     (uint32_t)interface_id << 24 |
+                     (uint32_t)cipher << 18 |
+                     (uint32_t)ESP32_WIFI_KEY_META_PAIRWISE_ROLE <<
+                         ESP32_WIFI_KEY_META_ROLE_SHIFT;
+
+    stl_le_p(record, word0);
+    stl_le_p(record + 4, word1);
+    memcpy(record + 8, key, 16);
+}
+
+static void key_record_set_group(uint8_t record[40], unsigned key_id)
+{
+    uint32_t word1 = ldl_le_p(record + 4);
+
+    word1 &= ~((uint32_t)ESP32_WIFI_KEY_META_ROLE_MASK <<
+               ESP32_WIFI_KEY_META_ROLE_SHIFT);
+    word1 |= (uint32_t)ESP32_WIFI_KEY_META_GROUP_ROLE <<
+             ESP32_WIFI_KEY_META_ROLE_SHIFT;
+    word1 &= ~((uint32_t)ESP32_WIFI_KEY_META_GROUP_ID_MASK <<
+               ESP32_WIFI_KEY_META_GROUP_ID_SHIFT);
+    word1 |= (uint32_t)key_id << ESP32_WIFI_KEY_META_GROUP_ID_SHIFT;
+    stl_le_p(record + 4, word1);
+}
+
+static void test_guest_key_record_lookup(void)
+{
+    uint8_t table[32][40] = { 0 };
+    const uint8_t peer[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x55 };
+    const uint8_t other[6] = { 0x02, 0x11, 0x22, 0x33, 0x44, 0x56 };
+    uint8_t expected[16], wrong[16];
+    Esp32WifiKey key;
+    uint32_t valid = 0;
+
+    memset(expected, 0x5a, sizeof(expected));
+    memset(wrong, 0xa5, sizeof(wrong));
+    /* Same address on two interfaces and a colliding address with the wrong
+     * cipher must not select an arbitrary record. */
+    key_record_set(table[4], peer, 0, ESP32_WIFI_KEY_CIPHER_CCMP, wrong);
+    key_record_set(table[5], other, 0, ESP32_WIFI_KEY_CIPHER_CCMP, wrong);
+    key_record_set(table[6], peer, 1, ESP32_WIFI_KEY_CIPHER_CCMP, expected);
+    key_record_set(table[7], peer, 1, 1, wrong);
+    valid = (1u << 4) | (1u << 5) | (1u << 6) | (1u << 7);
+    g_assert_true(esp32_wifi_key_lookup(table, valid, 1, ESP32_WIFI_KEY_CIPHER_CCMP, peer, -1,
+                                        &key));
+    g_assert_cmpuint(key.index, ==, 6);
+    g_assert_cmpuint(key.interface_id, ==, 1);
+    g_assert_cmpuint(key.cipher, ==, ESP32_WIFI_KEY_CIPHER_CCMP);
+    g_assert_cmpuint(key.length, ==, 16);
+    g_assert_cmpmem(key.bytes, 16, expected, 16);
+    g_assert_true(esp32_wifi_key_lookup(table, valid, 0, ESP32_WIFI_KEY_CIPHER_CCMP, peer, -1,
+                                        &key));
+    g_assert_cmpuint(key.index, ==, 4);
+    g_assert_cmpmem(key.bytes, 16, wrong, 16);
+    g_assert_false(esp32_wifi_key_lookup(table, valid, 2, ESP32_WIFI_KEY_CIPHER_CCMP, peer, -1,
+                                         &key));
+    g_assert_false(esp32_wifi_key_lookup(table, valid, 1, ESP32_WIFI_KEY_CIPHER_CCMP, other, -1,
+                                         &key));
+    g_assert_false(esp32_wifi_key_lookup(table, valid & ~(1u << 6), 1, ESP32_WIFI_KEY_CIPHER_CCMP,
+                                         peer, -1, &key));
+    g_assert_false(esp32_wifi_key_lookup(table, valid, 1, 2, peer, -1,
+                                         &key));
+
+    /* Pairwise records can occupy any hardware slot 4..31; the IDF
+     * allocator's narrower search policy is not a hardware restriction. */
+    key_record_set(table[28], peer, 1, ESP32_WIFI_KEY_CIPHER_CCMP, expected);
+    g_assert_true(esp32_wifi_key_lookup(table, 1u << 28, 1,
+                                        ESP32_WIFI_KEY_CIPHER_CCMP, peer, -1,
+                                        &key));
+    g_assert_cmpuint(key.index, ==, 28);
+    key_record_set(table[29], peer, 1, ESP32_WIFI_KEY_CIPHER_CCMP, wrong);
+    g_assert_true(esp32_wifi_key_lookup(table, 1u << 29, 1, ESP32_WIFI_KEY_CIPHER_CCMP, peer, -1,
+                                        &key));
+    g_assert_cmpuint(key.index, ==, 29);
+    g_assert_cmpmem(key.bytes, 16, wrong, 16);
+    key_record_set(table[31], peer, 1, ESP32_WIFI_KEY_CIPHER_CCMP, expected);
+    g_assert_true(esp32_wifi_key_lookup(table, 1u << 31, 1, ESP32_WIFI_KEY_CIPHER_CCMP, peer, -1,
+                                        &key));
+    g_assert_cmpuint(key.index, ==, 31);
+
+    /* GTK IDs are encoded in metadata and map independently to physical
+     * slots. Exercise a non-identity mapping, including ID1 in slot0 as seen
+     * in the supplied firmware's setter capture. */
+    static const uint8_t slot_for_id[] = { 1, 0, 3, 2 };
+    for (unsigned id = 0; id < G_N_ELEMENTS(slot_for_id); id++) {
+        unsigned slot = slot_for_id[id];
+        key_record_set(table[slot], peer, 1, ESP32_WIFI_KEY_CIPHER_CCMP,
+                       expected);
+        key_record_set_group(table[slot], id);
+        valid |= 1u << slot;
+    }
+    for (unsigned id = 0; id < G_N_ELEMENTS(slot_for_id); id++) {
+        g_assert_true(esp32_wifi_key_lookup(table, valid, 1,
+                                            ESP32_WIFI_KEY_CIPHER_CCMP,
+                                            peer, id, &key));
+        g_assert_cmpuint(key.index, ==, slot_for_id[id]);
+    }
+    g_assert_false(esp32_wifi_key_lookup(table, valid, 1,
+                                         ESP32_WIFI_KEY_CIPHER_CCMP, peer, 4,
+                                         &key));
+    g_assert_false(esp32_wifi_key_lookup(table, valid & ~(1u << 3), 1,
+                                         ESP32_WIFI_KEY_CIPHER_CCMP,
+                                         peer, 2, &key));
 }
 
 int main(int argc, char **argv)
@@ -336,11 +586,15 @@ int main(int argc, char **argv)
     g_test_add_func("/esp32/wifi/security/pmk-vector", test_pmk_wpa_vector);
     g_test_add_func("/esp32/wifi/security/ccmp-roundtrip",
                     test_ccmp_roundtrip_and_mic_reject);
+    g_test_add_func("/esp32/wifi/security/ccmp-pn-exhaustion",
+                    test_ccmp_packet_number_exhaustion);
     g_test_add_func("/esp32/wifi/security/ccmp-ieee-vector",
                     test_ccmp_ieee_reference_vector);
     g_test_add_func("/esp32/wifi/security/four-way-handshake",
                     test_wpa2_four_way_handshake);
     g_test_add_func("/esp32/wifi/security/rsn-suite-selection",
                     test_rsn_suite_selection);
+    g_test_add_func("/esp32/wifi/security/guest-key-record-lookup",
+                    test_guest_key_record_lookup);
     return g_test_run();
 }

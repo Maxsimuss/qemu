@@ -29,18 +29,28 @@
  */
 
 #include "qemu/osdep.h"
+#include <zlib.h>
 
 #include "net/net.h"
 
 #include "esp32_wlan.h"
 #include "esp32_wlan_packet.h"
 
-// the frame checksum isn't used so just put zero in there.
+#define DHCP_MIN_OPTIONS_LEN 68
+
 void insertCRC(mac80211_frame *frame) {
-    unsigned long crc;
-    unsigned char *fcs = (unsigned char *)frame;
-    crc = 0;
-    memcpy(fcs+frame->frame_length, &crc, 4);
+    uint32_t crc;
+
+    /* Peer-generated 802.11 frames carry the IEEE 802.11 FCS.  Chip TX
+     * frames are handled separately by the guest's MAC offload path. */
+    if (!frame || frame->frame_length < IEEE80211_HEADER_SIZE ||
+        frame->frame_length > IEEE80211_HEADER_SIZE + 2312) {
+        return;
+    }
+    /* zlib's API applies the conventional initial/final XOR internally for
+     * a zero seed, producing the IEEE 802.11 FCS value. */
+    crc = crc32(0, (const Bytef *)frame, frame->frame_length);
+    stl_le_p((uint8_t *)frame + frame->frame_length, crc);
     frame->frame_length += 4;
 }
 
@@ -65,7 +75,7 @@ void Esp32_WLAN_init_ap_frame(Esp32WifiState *s, mac80211_frame *frame) {
 }
 
 static mac80211_frame *new_frame(unsigned type, unsigned subtype) {
-    mac80211_frame *frame = (mac80211_frame *)malloc(sizeof(mac80211_frame));
+    mac80211_frame *frame = g_new0(mac80211_frame, 1);
     frame->next_frame = NULL;
     frame->frame_control.protocol_version = 0;
     frame->frame_control.type = type;
@@ -73,6 +83,7 @@ static mac80211_frame *new_frame(unsigned type, unsigned subtype) {
     frame->frame_control._flags = 0;
     frame->frame_control.from_ds = 0;
     frame->frame_control.to_ds = 0;
+    frame->signal_strength = -40;
     frame->duration_id = 314;
     frame->sequence_control.fragment_number = 0;
     frame->pos=0;
@@ -132,16 +143,20 @@ static uint16_t in_cksum(uint16_t *addr, int len) {
     return (answer);
 }
 
-static mac80211_frame *Esp32_WLAN_create_dhcp_frame(int cmd_size, uint8_t dhcp_commands[]) {
+static mac80211_frame *Esp32_WLAN_create_dhcp_frame(
+    const dhcp_t *bootp, int cmd_size, const uint8_t dhcp_commands[])
+{
     mac80211_frame *frame=new_frame(IEEE80211_TYPE_DATA,IEEE80211_TYPE_DATA_SUBTYPE_DATA);
     frame->frame_control.to_ds=1;
     add_data(frame,8,(uint8_t[]){ 0xaa, 0xaa ,0x03 ,00 ,00 ,00 ,8 ,00});
-    dhcp_request_t req={
-        {.version_size=0x45,.ttl=0xff,.protocol=0x11,.dest_ip={0xff,0xff,0xff,0xff}},
-        {.src_port_l=0x44,.dest_port_l=0x43},
-        {.htype=1,.hlen=6,.xid=0x1d3d00,.chaddr={0x10,0x01,0x00,0xc4,0x0a,0x24},
-        .magic_cookie=0x63538263}
+    dhcp_request_t req = {
+        .ipheader = {
+            .version_size = 0x45, .ttl = 0xff, .protocol = 0x11,
+            .dest_ip = {0xff,0xff,0xff,0xff},
+        },
+        .udpheader = {.src_port_l = 0x44, .dest_port_l = 0x43},
     };
+    memcpy(&req.dhcp, bootp, offsetof(dhcp_t, bp_options));
     int len=sizeof(req)+cmd_size;
     req.ipheader.len_h=len>>8;
     req.ipheader.len_l=len&0xff;
@@ -150,32 +165,88 @@ static mac80211_frame *Esp32_WLAN_create_dhcp_frame(int cmd_size, uint8_t dhcp_c
     req.udpheader.len_l=len&0xff;
     req.ipheader.checksum=in_cksum((void *)&req.ipheader,sizeof(ip_header_t));
     add_data(frame,sizeof(req),(uint8_t *)&req);
-    add_data(frame,cmd_size,dhcp_commands);
+    add_data(frame,cmd_size,(uint8_t *)dhcp_commands);
     return frame;
 }
 
-mac80211_frame *Esp32_WLAN_create_dhcp_request(uint8_t *ip) {
-    uint8_t dhcp_commands[]={
-        0x35, 1, 3,
-        0x39, 2 ,5 ,0xdc ,
-        0x32, 4, ip[0],ip[1],ip[2],ip[3],
-        0x3d, 0x07, 0x01, 0x3c, 0x61, 0x05, 0x0d, 0x99, 0x24,
-        0x37, 0x04, 0x01, 0x03, 0x1c, 0x06,
-        0xff, 0, 0
-    };
-    return Esp32_WLAN_create_dhcp_frame(sizeof(dhcp_commands),dhcp_commands);
+mac80211_frame *Esp32_WLAN_create_dhcp_request(const dhcp_t *offer,
+                                              const uint8_t server_id[4]) {
+    uint8_t dhcp_commands[DHCP_MIN_OPTIONS_LEN] = { 0 };
+    size_t option = 0;
+    dhcp_t request = {0};
+
+    request.opcode = 1;
+    request.htype = offer->htype;
+    request.hlen = offer->hlen;
+    /* These are network-order fields; retain their wire bytes rather than
+     * load/store them through the host-endian integer representation. */
+    memcpy(&request.xid, &offer->xid, sizeof(request.xid));
+    memcpy(&request.secs, &offer->secs, sizeof(request.secs));
+    /* The station has no configured IPv4 address yet and cannot receive a
+     * unicast ACK at yiaddr.  Its BOOTP broadcast bit is client capability,
+     * not a value to copy from the server's OFFER. */
+    memcpy(&request.flags, (const uint8_t[]){ 0x80, 0x00 },
+           sizeof(request.flags));
+    memcpy(request.chaddr, offer->chaddr, offer->hlen);
+    memcpy(&request.magic_cookie,
+           (const uint8_t[]){0x63,0x82,0x53,0x63}, 4);
+
+    /* Build the station's Selecting-state DHCPREQUEST from the received
+     * OFFER so transaction identity and client hardware address match. */
+    dhcp_commands[option++] = 53;
+    dhcp_commands[option++] = 1;
+    dhcp_commands[option++] = 3;
+    dhcp_commands[option++] = 57;
+    dhcp_commands[option++] = 2;
+    dhcp_commands[option++] = 5;
+    dhcp_commands[option++] = 0xdc;
+    dhcp_commands[option++] = 50;
+    dhcp_commands[option++] = 4;
+    memcpy(dhcp_commands + option, offer->yiaddr, 4);
+    option += 4;
+    dhcp_commands[option++] = 54;
+    dhcp_commands[option++] = 4;
+    memcpy(dhcp_commands + option, server_id, 4);
+    option += 4;
+    dhcp_commands[option++] = 61;
+    dhcp_commands[option++] = 7;
+    dhcp_commands[option++] = 1;
+    memcpy(dhcp_commands + option, offer->chaddr, 6);
+    option += 6;
+    dhcp_commands[option++] = 55;
+    dhcp_commands[option++] = 4;
+    memcpy(dhcp_commands + option, (uint8_t[]){1,3,28,6}, 4);
+    option += 4;
+    dhcp_commands[option++] = 255;
+    /* lwIP's DHCP client pads the options field to its RFC minimum of 68
+     * bytes, yielding a 308-byte BOOTP/DHCP payload including the cookie. */
+    option = MAX(option, sizeof(dhcp_commands));
+    return Esp32_WLAN_create_dhcp_frame(&request, option,
+                                        dhcp_commands);
 }
 
-mac80211_frame *Esp32_WLAN_create_dhcp_discover(void) {
-    uint8_t dhcp_commands[]={
+mac80211_frame *Esp32_WLAN_create_dhcp_discover(
+    const uint8_t client_mac[6], const uint8_t xid[4])
+{
+    uint8_t dhcp_commands[DHCP_MIN_OPTIONS_LEN] = {
         0x35, 1, 1,
-        0x39, 2 ,5 ,0xdc ,
-        0x0c ,0x09 ,0x65 ,0x73 ,0x70 ,0x72 ,0x65 ,0x73 ,0x73 ,0x69 ,0x66 ,
-        0x3d ,0x07, 0x01 ,0x3c ,0x61 ,0x05 ,0x0d ,0x99 ,0x24 ,
-        0x37 ,0x04 ,0x01 ,0x03 ,0x1c ,0x06 ,
-        0xff, 0,0
+        0x39, 2, 5, 0xdc,
+        0x0c, 0x09, 'e', 's', 'p', 'r', 'e', 's', 's', 'i', 'f',
+        0x3d, 0x07, 0x01, client_mac[0], client_mac[1], client_mac[2],
+        client_mac[3], client_mac[4], client_mac[5],
+        0x37, 0x04, 0x01, 0x03, 0x1c, 0x06,
+        0xff,
     };
-    return Esp32_WLAN_create_dhcp_frame(sizeof(dhcp_commands),dhcp_commands);
+    dhcp_t discover = { .opcode = 1, .htype = 1, .hlen = 6 };
+
+    memcpy(&discover.xid, xid, sizeof(discover.xid));
+    memcpy(&discover.flags, (const uint8_t[]){ 0x80, 0x00 },
+           sizeof(discover.flags));
+    memcpy(discover.chaddr, client_mac, 6);
+    memcpy(&discover.magic_cookie,
+           (const uint8_t[]){0x63,0x82,0x53,0x63}, 4);
+    return Esp32_WLAN_create_dhcp_frame(&discover, sizeof(dhcp_commands),
+                                        dhcp_commands);
 }
 
 mac80211_frame *Esp32_WLAN_create_association_request(access_point_info *ap) {
@@ -194,6 +265,7 @@ mac80211_frame *Esp32_WLAN_create_ack(void) {
 
 mac80211_frame *Esp32_WLAN_create_probe_response(access_point_info *ap) {
     mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_PROBE_RESP);
+    frame->signal_strength=ap->sigstrength;
     frame->beacon_info.timestamp=qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)/1000;
     frame->beacon_info.interval=1000;
     frame->beacon_info.capability=ap->wpa2 ? 0x11 : 1;
@@ -217,6 +289,7 @@ mac80211_frame *Esp32_WLAN_create_probe_request(access_point_info *ap) {
 
 mac80211_frame *Esp32_WLAN_create_authentication_response(access_point_info *ap) {
     mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_AUTHENTICATION);
+    frame->signal_strength=ap->sigstrength;
     /*
      * Fixed params... typical AP params (6 byte)
      *
@@ -224,9 +297,10 @@ mac80211_frame *Esp32_WLAN_create_authentication_response(access_point_info *ap)
      *  - Authentication Algorithm (here: Open System)
      *  - Authentication SEQ
      *  - Status code (successful 0x0)
-     */
+    */
     add_data(frame,6,(uint8_t []){0,0,2,0,0,0});
-    add_ssid(frame,ap->ssid);
+    /* IEEE 802.11 Authentication carries only the six fixed bytes above;
+     * the SSID belongs in probe/beacon frames, not this response. */
     return frame;
 }
 
@@ -248,17 +322,19 @@ mac80211_frame *Esp32_WLAN_create_authentication_request(void) {
 }
 
 mac80211_frame *Esp32_WLAN_create_deauthentication(void) {
+    return Esp32_WLAN_create_deauthentication_reason(3);
+}
+
+mac80211_frame *Esp32_WLAN_create_deauthentication_reason(uint16_t reason)
+{
     mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION);
-    /*
-     * Insert reason code:
-     *  "Deauthentication because sending STA is leaving"
-     */
-    add_data(frame,2,(uint8_t []){3,0});
+    add_data(frame, 2, (uint8_t[]){reason, reason >> 8});
     return frame;
 }
 
 mac80211_frame *Esp32_WLAN_create_association_response(access_point_info *ap) {
     mac80211_frame *frame=new_frame(IEEE80211_TYPE_MGT,IEEE80211_TYPE_MGT_SUBTYPE_ASSOCIATION_RESP);
+    frame->signal_strength=ap->sigstrength;
     /*
      * Fixed params... typical AP params (6 byte)
      *
