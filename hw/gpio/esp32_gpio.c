@@ -1,6 +1,8 @@
 /*
  * ESP32 digital pads, IO MUX and GPIO matrix.
  *
+ * Copyright (c) 2019 Espressif Systems (Shanghai) Co. Ltd.
+ *
  * References: ESP32 TRM v5.8 chapter 6; ESP32 Series Datasheet pin inventory.
  * The resolved pad is distinct from GPIO_OUT and includes electrical release,
  * GPIO/peripheral OE, open-drain operation, pulls and external strong drivers.
