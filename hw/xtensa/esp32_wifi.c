@@ -162,7 +162,9 @@ static int esp32_wifi_fe_reg_index(hwaddr addr, bool fe2)
 #define ESP32_WIFI_FE_IQ_START BIT(1)
 #define ESP32_WIFI_FE_IQ_READY BIT(31)
 #define ESP32_WIFI_FE_IQ_DELAY_NS 1000
-#define ESP32_TXDC_PHY_CLOCKS 0x00008f8f
+/* Wi-Fi TXDC/IQ calibration needs the PHY clocks, but not DPORT's BT clock
+ * bit 11. IDF 5.1 leaves that bit clear when Bluetooth is disabled. */
+#define ESP32_TXDC_PHY_CLOCKS 0x0000878f
 
 static void esp32_wifi_fe_pbus_complete(void *opaque)
 {

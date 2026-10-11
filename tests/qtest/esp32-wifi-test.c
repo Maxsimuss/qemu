@@ -27,6 +27,8 @@
 #define DPORT_CORE_RST_EN 0x3ff000d0
 #define DPORT_WIFI_CLK_RESET 0xfffce030
 #define DPORT_WIFI_MAC_CLOCKS 0x00000406
+#define DPORT_WIFI_PHY_CLOCKS 0x0000878f
+#define DPORT_WIFI_BT_CLOCK BIT(11)
 #define DPORT_WIFIMAC_RST (1u << 2)
 #define MATRIX 0x3ff00104
 #define INTMATRIX_PATH "/machine/soc/intmatrix"
@@ -382,10 +384,21 @@ static void txdc_pbus_completion_requires_phy_clocks(void)
     qtest_clock_step(q, 2000);
     g_assert_false(qtest_readl(q, ESP32_WIFI_TXDC_PBUS_APB) & BIT(24));
 
-    /* PHY clock outputs come from the documented DPORT clock register.
-     * The command completes only when all observed Wi-Fi PHY clock enables
-     * are active and FE reset is deasserted. */
-    qtest_writel(q, DPORT_WIFI_CLK_EN, 0x00008f8f);
+    /* Bluetooth's DPORT clock bit is not needed for Wi-Fi calibration and
+     * remains off in the IDF 5.1 BT-disabled firmware configuration. */
+    qtest_writel(q, DPORT_WIFI_CLK_EN,
+                 DPORT_WIFI_PHY_CLOCKS & ~BIT(15));
+    txdc_program_candidate(q, 2, 1, 0x100);
+    txdc_program_candidate(q, 3, 1, 0x100);
+    qtest_writel(q, command, 0x00113cf1);
+    qtest_writel(q, command, 0x00113cf3);
+    qtest_clock_step(q, 2000);
+    g_assert_false(qtest_readl(q, ESP32_WIFI_TXDC_PBUS_APB) & BIT(24));
+
+    /* The full Wi-Fi PHY clock set completes TXDC with BT bit 11 still
+     * clear, while FE reset remains deasserted. */
+    qtest_writel(q, DPORT_WIFI_CLK_EN, DPORT_WIFI_PHY_CLOCKS);
+    g_assert_false(qtest_readl(q, DPORT_WIFI_CLK_EN) & DPORT_WIFI_BT_CLOCK);
     txdc_program_candidate(q, 2, 1, 0x100);
     txdc_program_candidate(q, 3, 1, 0x100);
     qtest_writel(q, command, 0x00113cf1);
@@ -427,7 +440,7 @@ static void txdc_pbus_measures_programmed_candidates(void)
                                "-nic none");
     uint32_t measurement = ESP32_WIFI_TXDC_PBUS_BASE;
 
-    qtest_writel(q, DPORT_WIFI_CLK_EN, 0x00008f8f);
+    qtest_writel(q, DPORT_WIFI_CLK_EN, DPORT_WIFI_PHY_CLOCKS);
     txdc_program_candidate(q, 2, 1, 255);
     txdc_program_candidate(q, 3, 1, 255);
     qtest_writel(q, measurement, 0x00113cf1);
@@ -596,7 +609,14 @@ static void fe_iq_estimator_requires_enable_and_clocks(void)
     qtest_clock_step(q, 2000);
     g_assert_false(qtest_readl(q, iq) & BIT(31));
 
-    qtest_writel(q, DPORT_WIFI_CLK_EN, 0x00008f8f);
+    qtest_writel(q, DPORT_WIFI_CLK_EN,
+                 DPORT_WIFI_PHY_CLOCKS & ~BIT(15));
+    qtest_writel(q, iq, BIT(0));
+    qtest_writel(q, iq, BIT(0) | BIT(1));
+    qtest_clock_step(q, 2000);
+    g_assert_false(qtest_readl(q, iq) & BIT(31));
+    qtest_writel(q, DPORT_WIFI_CLK_EN, DPORT_WIFI_PHY_CLOCKS);
+    g_assert_false(qtest_readl(q, DPORT_WIFI_CLK_EN) & DPORT_WIFI_BT_CLOCK);
     qtest_writel(q, iq, BIT(0));
     qtest_writel(q, iq, BIT(0) | BIT(1));
     g_assert_false(qtest_readl(q, iq) & BIT(31));
