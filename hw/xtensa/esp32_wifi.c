@@ -1910,6 +1910,8 @@ static Property esp32_wifi_properties[] = {
     DEFINE_PROP_STRING("peer-ssid", Esp32WifiState, peer_ssid),
     DEFINE_PROP_STRING("peer-password", Esp32WifiState, peer_password),
     DEFINE_PROP_UINT8("peer-channel", Esp32WifiState, peer_channel, 1),
+    DEFINE_PROP_BOOL("peer-multicast-to-unicast", Esp32WifiState,
+                     peer_multicast_to_unicast, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 static void esp32_wifi_class_init(ObjectClass *klass, void *data)

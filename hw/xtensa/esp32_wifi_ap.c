@@ -237,6 +237,12 @@ static void Esp32_WLAN_inject_timer(void *opaque)
         s->inject_timer_running = 0;
     }
 
+    /* TAP disables its read handler when can_receive applies backpressure.
+     * Draining the injection queue must complete queued network packets so
+     * the backend's send-completion callback can enable that handler again.
+     */
+    qemu_flush_queued_packets(qemu_get_queue(s->nic));
+
 }
 
 static void macprint(uint8_t *p, const char * name) {
@@ -914,6 +920,16 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
             } else {
                 memcpy(frame->receiver_address, s->security.station, 6);
             }
+            /* Optional AP multicast enhancement, as documented for Linux
+             * Wi-Fi bridges (IFLA_BRPORT_MCAST_TO_UCAST). This peer has one
+             * associated WPA2 station: transmit its multicast copies with
+             * unicast RA/PTK while preserving the IP destination and payload.
+             * Broadcast and the default group-addressed path stay unchanged.
+             */
+            if (s->peer_multicast_to_unicast && s->security.configured &&
+                (buf[0] & 1) && memcmp(buf, BROADCAST, 6)) {
+                memcpy(frame->receiver_address, s->security.station, 6);
+            }
             memcpy(frame->transmitter_address, s->associated_ap_macaddr, 6);
             memcpy(frame->address_3, buf + 6, 6);
         }
@@ -1340,6 +1356,8 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
             if (s->security.keys_installed) {
                 wpa_retry_clear(s);
                 wpa_remove_queued_key_frames(s);
+                /* WPA key installation also makes can_receive ready. */
+                qemu_flush_queued_packets(qemu_get_queue(s->nic));
                 return;
             }
             return;

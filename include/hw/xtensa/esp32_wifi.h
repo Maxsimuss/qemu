@@ -168,6 +168,7 @@ typedef struct Esp32WifiState {
     char *peer_ssid;
     char *peer_password;
     uint8_t peer_channel;
+    bool peer_multicast_to_unicast;
     /* RF channel selected by a completed, supported C4 tune operation. */
     uint8_t rf_channel;
     Esp32Wpa2Peer security;
