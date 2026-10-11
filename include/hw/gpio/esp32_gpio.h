@@ -146,6 +146,7 @@ bool esp32_gpio_output_needs_edges_except_input(Esp32GpioState *s,
 bool esp32_gpio_output_feeds_input(Esp32GpioState *s, unsigned output_signal,
                                    unsigned input_signal);
 bool esp32_gpio_input_needs_edges(Esp32GpioState *s, unsigned signal);
+bool esp32_gpio_input_is_static(Esp32GpioState *s, unsigned signal);
 unsigned esp32_gpio_get_input_level(Esp32GpioState *s, unsigned signal);
 unsigned esp32_gpio_get_input_level_at(Esp32GpioState *s, unsigned signal,
                                        int64_t time_ns);

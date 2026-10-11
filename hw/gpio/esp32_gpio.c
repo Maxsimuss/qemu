@@ -991,6 +991,34 @@ bool esp32_gpio_input_needs_edges(Esp32GpioState *s, unsigned signal)
     return false;
 }
 
+/* True when the selected physical input cannot change between callbacks.
+ * An active analytic output is the one edge-free source that can still vary
+ * with time; ordinary driven/pulled inputs are already rejected by
+ * esp32_gpio_input_needs_edges(). */
+bool esp32_gpio_input_is_static(Esp32GpioState *s, unsigned signal)
+{
+    uint32_t cfg;
+    unsigned pad;
+    int output;
+
+    if (!s || signal >= ESP32_GPIO_SIGNALS ||
+        esp32_gpio_input_needs_edges(s, signal)) {
+        return false;
+    }
+    cfg = R(s, GPIO_INPUT_SEL + signal * 4);
+    if (!(cfg & BIT(7))) {
+        return true;
+    }
+    pad = cfg & 63;
+    if (!valid_pad(pad) || pad == 0x38 || !(mux_value(s, pad) & IOMUX_IE)) {
+        return true;
+    }
+    output = selected_output(s, pad);
+    return output < 0 || output >= ESP32_GPIO_OUTPUTS ||
+           !s->analytic_clock[output] ||
+           !esp32_gpio_output_feeds_input(s, output, signal);
+}
+
 unsigned esp32_gpio_get_input_level(Esp32GpioState *s, unsigned signal)
 {
     if (!s || signal >= ESP32_GPIO_SIGNALS) {
