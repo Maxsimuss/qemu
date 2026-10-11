@@ -730,14 +730,81 @@ static void camera_rx(Esp32I2SState *s)
     rx_store_frame(s);
 }
 
+static uint32_t reverse_bits32(uint32_t v)
+{
+    v = ((v & UINT32_C(0x55555555)) << 1) |
+        ((v >> 1) & UINT32_C(0x55555555));
+    v = ((v & UINT32_C(0x33333333)) << 2) |
+        ((v >> 2) & UINT32_C(0x33333333));
+    v = ((v & UINT32_C(0x0f0f0f0f)) << 4) |
+        ((v >> 4) & UINT32_C(0x0f0f0f0f));
+    v = ((v & UINT32_C(0x00ff00ff)) << 8) |
+        ((v >> 8) & UINT32_C(0x00ff00ff));
+    return (v << 16) | (v >> 16);
+}
+
+static uint64_t spread32bits(uint32_t v)
+{
+    uint64_t x = v;
+    x = (x | (x << 16)) & UINT64_C(0x0000ffff0000ffff);
+    x = (x | (x << 8)) & UINT64_C(0x00ff00ff00ff00ff);
+    x = (x | (x << 4)) & UINT64_C(0x0f0f0f0f0f0f0f0f);
+    x = (x | (x << 2)) & UINT64_C(0x3333333333333333);
+    return (x | (x << 1)) & UINT64_C(0x5555555555555555);
+}
+
+static __uint128_t spread64bits(uint64_t v)
+{
+    return ((__uint128_t)spread32bits(v >> 32) << 64) |
+           spread32bits(v);
+}
+
 static unsigned tx_frame_values(Esp32I2SState *s, uint64_t *data,
                                 uint64_t *ws, __uint128_t *data_levels,
                                 __uint128_t *ws_levels, bool origin_falling)
 {
     unsigned bits = sample_bits(s, true);
     unsigned count = 2 * bits;
-    unsigned first = !!(REG(s, CONF) & BIT(8));
-    unsigned shifted = !!(REG(s, CONF) & BIT(10));
+    unsigned conf = REG(s, CONF);
+    unsigned first = !!(conf & BIT(8));
+    unsigned shifted = !!(conf & BIT(10));
+
+    if (bits == 32 && !(conf & BIT(12))) {
+        uint32_t a = s->tx.frame[first ? 1 : 0];
+        uint32_t b = s->tx.frame[first ? 0 : 1];
+        uint32_t ra = reverse_bits32(a);
+        uint32_t rb = reverse_bits32(b);
+        uint64_t serial = ra | ((uint64_t)rb << 32);
+        uint64_t ws_serial;
+        __uint128_t data_even, ws_even;
+
+        if (!shifted) {
+            ws_serial = first ? UINT32_MAX : (uint64_t)UINT32_MAX << 32;
+        } else {
+            ws_serial = (uint64_t)UINT32_MAX << 31;
+            if (first) {
+                ws_serial = ~ws_serial;
+            }
+        }
+        *data = serial;
+        *ws = ws_serial;
+        data_even = ((__uint128_t)spread32bits(serial >> 32) << 64) |
+                    spread32bits(serial);
+        ws_even = ((__uint128_t)spread32bits(ws_serial >> 32) << 64) |
+                  spread32bits(ws_serial);
+        if (origin_falling) {
+            *data_levels = data_even | (data_even << 1);
+            *ws_levels = ws_even | (ws_even << 1);
+        } else {
+            *data_levels = data_even |
+                (spread64bits(serial >> 1) << 1) |
+                ((__uint128_t)(serial >> 63) << 127);
+            *ws_levels = ws_even |
+                (spread64bits(ws_serial >> 1) << 1) |
+                ((__uint128_t)(ws_serial >> 63) << 127);
+        }
+        return count;
+    }
 
     *data = *ws = 0;
     *data_levels = *ws_levels = 0;
@@ -777,12 +844,10 @@ static unsigned tx_frame_values(Esp32I2SState *s, uint64_t *data,
 static void tx_analytic_patterns(Esp32I2SState *s, int64_t origin,
                                  uint64_t half_num, uint64_t half_den,
                                  uint64_t remainder, unsigned count,
+                                 __uint128_t data_levels,
+                                 __uint128_t ws_levels,
                                  bool origin_falling)
 {
-    __uint128_t data_levels = 0, ws_levels = 0;
-    uint64_t unused_data, unused_ws;
-    tx_frame_values(s, &unused_data, &unused_ws, &data_levels, &ws_levels,
-                    origin_falling);
     esp32_gpio_set_analytic_pattern(s->gpio, signal_bck(s, true), true,
         origin, origin_falling ? 2 : 1, 2, half_num, half_den, remainder);
     esp32_gpio_set_analytic_pattern(s->gpio, signal_ws(s, true), true,
@@ -796,7 +861,7 @@ static bool tx_analytic_frame_start(Esp32I2SState *s, int64_t now,
 {
     Esp32I2SChannel *c = &s->tx;
     uint64_t half_num, half_den;
-    __uint128_t unused_data_levels, unused_ws_levels;
+    __uint128_t data_levels, ws_levels;
     unsigned count;
 
     if (!clock_period(s, divider, &half_num, &half_den)) {
@@ -809,14 +874,14 @@ static bool tx_analytic_frame_start(Esp32I2SState *s, int64_t now,
     c->analytic_frame_half_num = half_num;
     c->analytic_frame_half_den = half_den;
     count = tx_frame_values(s, &c->analytic_frame_data,
-                            &c->analytic_frame_ws, &unused_data_levels,
-                            &unused_ws_levels, false);
+                            &c->analytic_frame_ws, &data_levels,
+                            &ws_levels, false);
     c->analytic_frame_count = count;
     c->analytic_frame_pending = true;
     s->rx.analytic_sample_progress = 0;
     c->clock_level = true;
     tx_analytic_patterns(s, now, half_num, half_den, c->clock_remainder,
-                         count, false);
+                         count, data_levels, ws_levels, false);
     /*
      * Retire one frame at its final falling edge so FIFO/DMA side effects
      * retain their hardware time instead of happening a frame early.
@@ -843,7 +908,7 @@ static bool tx_analytic_frame_end(Esp32I2SState *s, int64_t now,
     Esp32I2SChannel *c = &s->tx;
     unsigned bits = sample_bits(s, true);
     uint64_t half_num, half_den;
-    __uint128_t unused_data_levels, unused_ws_levels;
+    __uint128_t data_levels, ws_levels;
 
     if (c->analytic_frame_pending) {
         esp32_gpio_publish_serial_frame(s->gpio, signal_bck(s, true),
@@ -881,11 +946,12 @@ static bool tx_analytic_frame_end(Esp32I2SState *s, int64_t now,
     c->analytic_frame_half_num = half_num;
     c->analytic_frame_half_den = half_den;
     c->analytic_frame_count = tx_frame_values(s, &c->analytic_frame_data,
-        &c->analytic_frame_ws, &unused_data_levels, &unused_ws_levels, true);
+        &c->analytic_frame_ws, &data_levels, &ws_levels, true);
     c->analytic_frame_pending = true;
     s->rx.analytic_sample_progress = 0;
     tx_analytic_patterns(s, now, half_num, half_den, c->clock_remainder,
-                         c->analytic_frame_count, true);
+                         c->analytic_frame_count, data_levels, ws_levels,
+                         true);
     if (!clock_advance(s, divider, &c->clock_remainder, &c->deadline,
                        4 * bits)) {
         return false;
@@ -1982,6 +2048,12 @@ static void i2s_reset_hold(Object *obj, ResetType type)
     qemu_irq_lower(s->irq);
 }
 
+static char *i2s_get_virtual_time(Object *obj, Error **errp)
+{
+    return g_strdup_printf("%" PRId64,
+                           qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+}
+
 static void i2s_init(Object *obj)
 {
     Esp32I2SState *s = ESP32_I2S(obj);
@@ -1995,6 +2067,8 @@ static void i2s_init(Object *obj)
     s->apll_denominator = 1;
     s->inputs = qemu_allocate_irqs(input_changed, s, 25);
     s->enabled = true;
+    object_property_add_str(obj, "virtual-time-ns", i2s_get_virtual_time,
+                            NULL);
 }
 
 static void i2s_finalize(Object *obj)
