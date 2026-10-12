@@ -148,24 +148,11 @@ static uint64_t get_be64(const uint8_t *p)
     return v;
 }
 
-static bool aes_block(const uint8_t key[16], const uint8_t in[16],
-                      uint8_t out[16], bool decrypt)
+static bool aes_block(QCryptoCipher *cipher, const uint8_t in[16],
+                      uint8_t out[16], bool decrypt, Error **errp)
 {
-    Error *err = NULL;
-    QCryptoCipher *c = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
-                                          QCRYPTO_CIPHER_MODE_ECB,
-                                          key, 16, &err);
-    int ret;
-
-    if (!c) {
-        error_free(err);
-        return false;
-    }
-    ret = decrypt ? qcrypto_cipher_decrypt(c, in, out, 16, &err) :
-                    qcrypto_cipher_encrypt(c, in, out, 16, &err);
-    qcrypto_cipher_free(c);
-    error_free(err);
-    return ret == 0;
+    return (decrypt ? qcrypto_cipher_decrypt(cipher, in, out, 16, errp) :
+                      qcrypto_cipher_encrypt(cipher, in, out, 16, errp)) == 0;
 }
 
 static bool hmac_sha1(const uint8_t *key, size_t keylen,
@@ -228,8 +215,16 @@ static bool aes_wrap(const uint8_t kek[16], const uint8_t *plain, size_t len,
 {
     uint8_t a[8], block[16], enc[16];
     size_t n = len / 8;
+    Error *err = NULL;
+    QCryptoCipher *aes;
 
     if (!len || len % 8 || n > 32) {
+        return false;
+    }
+    aes = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
+                             QCRYPTO_CIPHER_MODE_ECB, kek, 16, &err);
+    if (!aes) {
+        error_free(err);
         return false;
     }
     memset(a, 0xa6, sizeof(a));
@@ -238,7 +233,9 @@ static bool aes_wrap(const uint8_t kek[16], const uint8_t *plain, size_t len,
         for (size_t i = 1; i <= n; i++) {
             memcpy(block, a, 8);
             memcpy(block + 8, wrapped + 8 * i, 8);
-            if (!aes_block(kek, block, enc, false)) {
+            if (!aes_block(aes, block, enc, false, &err)) {
+                qcrypto_cipher_free(aes);
+                error_free(err);
                 return false;
             }
             uint64_t t = n * j + i;
@@ -251,6 +248,8 @@ static bool aes_wrap(const uint8_t kek[16], const uint8_t *plain, size_t len,
         }
     }
     memcpy(wrapped, a, 8);
+    qcrypto_cipher_free(aes);
+    error_free(err);
     return true;
 }
 
@@ -835,7 +834,7 @@ bool esp32_ccmp_decrypt(mac80211_frame *f, const uint8_t key[16],
     uint8_t *plain = NULL;
     uint64_t pn;
     Error *err = NULL;
-    QCryptoCipher *aes;
+    QCryptoCipher *aes = NULL;
     bool ok = false;
 
     if (!last_pn || !key || !f || f->frame_length < IEEE80211_HEADER_SIZE ||
@@ -873,27 +872,26 @@ bool esp32_ccmp_decrypt(mac80211_frame *f, const uint8_t key[16],
     memcpy(aad + 2, raw + 4, 18);
     aad[20] = raw[22] & 0x0f;
     aad[21] = 0;
-    memcpy(mac, b0, sizeof(mac));
-    if (!aes_block(key, mac, mac, false)) goto out;
-    block[0] = 0; block[1] = aad_len;
-    memcpy(block + 2, aad, 14);
-    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
-    if (!aes_block(key, mac, mac, false)) goto out;
-    memset(block, 0, sizeof(block));
-    memcpy(block, aad + 14, aad_len - 14);
-    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
-    if (!aes_block(key, mac, mac, false)) goto out;
-
     aes = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
                              QCRYPTO_CIPHER_MODE_ECB, key, 16, &err);
     if (!aes) goto out;
+    memcpy(mac, b0, sizeof(mac));
+    if (!aes_block(aes, mac, mac, false, &err)) goto out;
+    block[0] = 0; block[1] = aad_len;
+    memcpy(block + 2, aad, 14);
+    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
+    if (!aes_block(aes, mac, mac, false, &err)) goto out;
+    memset(block, 0, sizeof(block));
+    memcpy(block, aad + 14, aad_len - 14);
+    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
+    if (!aes_block(aes, mac, mac, false, &err)) goto out;
+
     for (size_t off = 0; off < cipher_len; off += 16) {
         size_t n = MIN((size_t)16, cipher_len - off);
         ctr[0] = 1;
         memcpy(ctr + 1, nonce, 13);
         put_be16(ctr + 14, off / 16 + 1);
         if (qcrypto_cipher_encrypt(aes, ctr, stream, 16, &err) < 0) {
-            qcrypto_cipher_free(aes);
             goto out;
         }
         for (size_t i = 0; i < n; i++) {
@@ -902,17 +900,14 @@ bool esp32_ccmp_decrypt(mac80211_frame *f, const uint8_t key[16],
         memset(block, 0, sizeof(block));
         memcpy(block, plain + off, n);
         for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
-        if (!aes_block(key, mac, mac, false)) {
-            qcrypto_cipher_free(aes);
-            goto out;
-        }
+        if (!aes_block(aes, mac, mac, false, &err)) goto out;
     }
     ctr[0] = 1; memcpy(ctr + 1, nonce, 13); memset(ctr + 14, 0, 2);
     if (qcrypto_cipher_encrypt(aes, ctr, stream, 16, &err) < 0) {
-        qcrypto_cipher_free(aes);
         goto out;
     }
     qcrypto_cipher_free(aes);
+    aes = NULL;
     memcpy(tag, mac, 8);
     for (unsigned i = 0; i < 8; i++) tag[i] ^= stream[i];
     if (memcmp(tag, body + 8 + cipher_len, 8)) {
@@ -925,6 +920,7 @@ bool esp32_ccmp_decrypt(mac80211_frame *f, const uint8_t key[16],
     *last_pn = pn;
     ok = true;
 out:
+    qcrypto_cipher_free(aes);
     g_free(plain);
     error_free(err);
     return ok;
@@ -951,7 +947,7 @@ bool esp32_ccmp_encrypt(mac80211_frame *f, const uint8_t key[16],
     uint8_t aad[32] = {0}, mac[16] = {0}, block[16], tag[16];
     uint64_t pn;
     Error *err = NULL;
-    QCryptoCipher *aes;
+    QCryptoCipher *aes = NULL;
 
     if (!next_pn || !key || !f || key_id > 3 ||
         f->frame_length < IEEE80211_HEADER_SIZE ||
@@ -991,19 +987,19 @@ bool esp32_ccmp_encrypt(mac80211_frame *f, const uint8_t key[16],
     memcpy(aad + 2, raw + 4, 18);
     aad[20] = raw[22] & 0x0f;
     aad[21] = 0;
-    memcpy(mac, b0, sizeof(mac));
-    if (!aes_block(key, mac, mac, false)) return false;
-    block[0] = 0; block[1] = 22;
-    memcpy(block + 2, aad, 14);
-    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
-    if (!aes_block(key, mac, mac, false)) return false;
-    memset(block, 0, sizeof(block));
-    memcpy(block, aad + 14, 8);
-    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
-    if (!aes_block(key, mac, mac, false)) return false;
     aes = qcrypto_cipher_new(QCRYPTO_CIPHER_ALGO_AES_128,
                              QCRYPTO_CIPHER_MODE_ECB, key, 16, &err);
     if (!aes) goto fail;
+    memcpy(mac, b0, sizeof(mac));
+    if (!aes_block(aes, mac, mac, false, &err)) goto fail;
+    block[0] = 0; block[1] = 22;
+    memcpy(block + 2, aad, 14);
+    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
+    if (!aes_block(aes, mac, mac, false, &err)) goto fail;
+    memset(block, 0, sizeof(block));
+    memcpy(block, aad + 14, 8);
+    for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
+    if (!aes_block(aes, mac, mac, false, &err)) goto fail;
     for (size_t off = 0; off < plain_len; off += 16) {
         size_t n = MIN((size_t)16, plain_len - off);
         memset(ctr, 0, sizeof(ctr)); ctr[0] = 1;
@@ -1013,12 +1009,13 @@ bool esp32_ccmp_encrypt(mac80211_frame *f, const uint8_t key[16],
         memset(block, 0, sizeof(block));
         memcpy(block, body + 8 + off, n);
         for (unsigned i = 0; i < 16; i++) mac[i] ^= block[i];
-        if (!aes_block(key, mac, mac, false)) goto fail;
+        if (!aes_block(aes, mac, mac, false, &err)) goto fail;
         for (size_t i = 0; i < n; i++) body[8 + off + i] ^= stream[i];
     }
     memset(ctr, 0, sizeof(ctr)); ctr[0] = 1; memcpy(ctr + 1, nonce, 13);
     if (qcrypto_cipher_encrypt(aes, ctr, stream, 16, &err) < 0) goto fail;
     qcrypto_cipher_free(aes);
+    aes = NULL;
     memcpy(tag, mac, 8);
     for (unsigned i = 0; i < 8; i++) body[8 + plain_len + i] = tag[i] ^ stream[i];
     error_free(err);
