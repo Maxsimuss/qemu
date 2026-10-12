@@ -47,8 +47,9 @@
  * meters (1.31, best effort — exact meter ballistics undocumented).
  *
  * DSP path per frame (float): I2S slots -> [-1,1) -> input mixer (9.23)
- * -> 12 x DF1 BQ per channel (Table 3-1: y = B0*x0 + 2*B1*x1 + B2*x2 +
- * 2*A1*y1 + A2*y2; skipped when BypassEQ, right uses left bank when
+ * -> 12 x DF1 BQ per channel (Q5.27 coefficients apply directly:
+ * y = B0*x0 + B1*x1 + B2*x2 + A1*y1 + A2*y2; skipped when BypassEQ,
+ * right uses left bank when
  * GangEQ) -> channel volume (9.23) -> DIG_VOL -> SAP dpath -> hard clip ->
  * WAV. DPEQ/DRC/AGL/clipper/crossbar are passthrough; proprietary DSP
  * processing is outside this external-device model's scope.
@@ -407,9 +408,9 @@ static double run_bq(Esp32Tas5828m *s, unsigned ch, unsigned bq, double x)
 {
     double *st = s->bq_state[ch][bq];
     double y = bq_coef(s, ch, bq, 0) * x +
-               2.0 * bq_coef(s, ch, bq, 1) * st[0] +
+               bq_coef(s, ch, bq, 1) * st[0] +
                bq_coef(s, ch, bq, 2) * st[1] +
-               2.0 * bq_coef(s, ch, bq, 3) * st[2] +
+               bq_coef(s, ch, bq, 3) * st[2] +
                bq_coef(s, ch, bq, 4) * st[3];
     st[1] = st[0];
     st[0] = x;
@@ -916,19 +917,18 @@ static void dsp_init_defaults(Esp32Tas5828m *s)
     s->peak[0] = s->peak[1] = 0;
 }
 
-/* The Process Flows guide stores signed Q5.27 feedback terms A1/A2 and
- * defines y[n] = ... + 2*A1*y[n-1] + A2*y[n-2].  Jury's strict second-order
- * conditions for z^2 - 2*A1*z - A2 are evaluated in integer coefficient
- * units, after quantization. Exact equality is marginal; strict inequality
- * determines stability.
+/* Stored Q5.27 coefficients are applied directly in the recurrence. Jury's
+ * strict second-order conditions for z^2 - A1*z - A2 are evaluated in integer
+ * coefficient units after quantization. Equality is marginal; strict
+ * inequality determines stability.
  */
 static const char *bq_safety(Esp32Tas5828m *s, uint8_t page, uint8_t base)
 {
     const int64_t scale = 1ll << 27;
     int64_t a1 = be32(&s->ramaa[page][base + 12]);
     int64_t a2 = be32(&s->ramaa[page][base + 16]);
-    int64_t c1 = scale - 2 * a1 - a2;
-    int64_t c2 = scale + 2 * a1 - a2;
+    int64_t c1 = scale - a1 - a2;
+    int64_t c2 = scale + a1 - a2;
     int64_t c3 = scale + a2;
 
     if (c1 < 0 || c2 < 0 || c3 < 0) {

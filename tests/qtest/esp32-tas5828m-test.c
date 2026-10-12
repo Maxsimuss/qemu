@@ -1,8 +1,8 @@
 /*
  * Tests for the esp32-tas5828m virtual TAS5828M amplifier with DSP BQ path.
  *
- * BQ math follows SLUUDB4 Table 3-1 (y = B0*x0 + 2*B1*x1 + B2*x2 +
- * 2*A1*y1 + A2*y2, 5.27) through book 0xAA; mixer/volume are 9.23.
+ * BQ words are applied as signed Q5.27 terms in the direct-form recurrence
+ * through book 0xAA; mixer/volume are 9.23.
  * Pads are driven with exact virtual time; I2C uses synthetic fixture pads.
  *
  * SPDX-License-Identifier: GPL-2.0-or-later
@@ -356,21 +356,21 @@ static void coefficient_safety_checks(void)
     g_clear_pointer(&status, g_free);
     status = coefficient_safety(d.q);
     g_assert_cmpstr(status, ==, "stable");
-    /* The feedback term is signed Q5.27. A1=+0.75 makes the documented
-     * characteristic polynomial fail Jury's strict condition. */
-    bq_write(d.q, 0, 0, 0x08000000, 0, 0, 0x06000000, 0);
+    /* The feedback term is signed Q5.27. A1=+1.25 fails Jury's strict
+     * condition for the direct-coefficient characteristic polynomial. */
+    bq_write(d.q, 0, 0, 0x08000000, 0, 0, 0x0A000000, 0);
     g_clear_pointer(&status, g_free);
     status = coefficient_safety(d.q);
     g_assert_cmpstr(status, ==, "unstable");
 
-    /* A1=+0.5 places a pole on the unit circle (marginal boundary). */
-    bq_write(d.q, 0, 0, 0x08000000, 0, 0, 0x04000000, 0);
+    /* A1=+1 places a pole on the unit circle (marginal boundary). */
+    bq_write(d.q, 0, 0, 0x08000000, 0, 0, 0x08000000, 0);
     g_clear_pointer(&status, g_free);
     status = coefficient_safety(d.q);
     g_assert_cmpstr(status, ==, "marginal");
 
     /* One coefficient LSB below the unit-circle boundary remains stable. */
-    bq_write(d.q, 0, 0, 0x08000000, 0, 0, 0x03FFFFFF, 0);
+    bq_write(d.q, 0, 0, 0x08000000, 0, 0, 0x07FFFFFF, 0);
     g_clear_pointer(&status, g_free);
     status = coefficient_safety(d.q);
     g_assert_cmpstr(status, ==, "stable");
@@ -394,12 +394,12 @@ static void coefficient_safety_checks(void)
     dut_end(&d);
 }
 
-/* Host DF1 model of one BQ (Table 3-1), state kept by caller. */
+/* Host DF1 model using the stored Q5.27 coefficients directly. */
 static double host_bq(double x, double c0, double c1, double c2,
                       double c3, double c4, double *x1, double *x2,
                       double *y1, double *y2)
 {
-    double y = c0 * x + 2.0 * c1 * *x1 + c2 * *x2 + 2.0 * c3 * *y1 + c4 * *y2;
+    double y = c0 * x + c1 * *x1 + c2 * *x2 + c3 * *y1 + c4 * *y2;
     *x2 = *x1; *x1 = x; *y2 = *y1; *y1 = y;
     return y;
 }
@@ -616,6 +616,45 @@ static void bq_gain_exact(void)
     dut_end(&d);
 }
 
+static void bq_first_order_terms_apply_once(void)
+{
+    Dut d = dut_start(NULL);
+    Synth s = synth_init(d.q, 32, BH32_48K);
+    /* B1 and A1 are each +0.125 in Q5.27 and apply directly, without a
+     * second multiplier in the device model's accumulator. */
+    bq_write(d.q, 0, 0, 0x08000000, 0x01000000, 0, 0x01000000, 0);
+    set_book_page(d.q, 0x00, 0x00);
+    tas_set(d.q, 0x33, 0x03);
+    tas_set(d.q, 0x02, 0x02);
+    tas_set(d.q, 0x03, 0x03);
+    enum { N = 16 };
+    double x1 = 0, x2 = 0, y1 = 0, y2 = 0;
+    double rx1 = 0, rx2 = 0, ry1 = 0, ry2 = 0;
+    int64_t expect_l[N], expect_r[N];
+    for (unsigned i = 0; i < N; i++) {
+        int32_t in = 0x00100000 * (int)(i + 1);
+        double x = in / 2147483648.0;
+        double yl = host_bq(x, 1.0, 0.125, 0, 0.125, 0,
+                            &x1, &x2, &y1, &y2);
+        double yr = host_bq(x, 1.0, 0, 0, 0, 0,
+                            &rx1, &rx2, &ry1, &ry2);
+        expect_l[i] = llround(yl * 2147483648.0);
+        expect_r[i] = llround(yr * 2147483648.0);
+        synth_frame(&s, in, in);
+    }
+    tas_hiz(d.q);
+    Wav w = wav_load(d.wav);
+    unsigned frames = w.data_bytes / 8;
+    g_assert_cmpuint(frames, >=, N - 3);
+    for (unsigned i = 0; i < frames; i++) {
+        unsigned src = N - frames + i;
+        g_assert_cmpint(wav_sample(&w, i, 0), ==, expect_l[src]);
+        g_assert_cmpint(wav_sample(&w, i, 1), ==, expect_r[src]);
+    }
+    wav_free(&w);
+    dut_end(&d);
+}
+
 static void mixer_volume_bypass(void)
 {
     Dut d = dut_start(NULL);
@@ -745,6 +784,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/tas5828m/two-instances", two_instances);
     qtest_add_func("/esp32/tas5828m/passthrough-exact", passthrough_exact);
     qtest_add_func("/esp32/tas5828m/bq-gain-exact", bq_gain_exact);
+    qtest_add_func("/esp32/tas5828m/bq-first-order-terms-apply-once",
+                   bq_first_order_terms_apply_once);
     qtest_add_func("/esp32/tas5828m/mixer-volume-bypass", mixer_volume_bypass);
     qtest_add_func("/esp32/tas5828m/volume-digvol-meters",
                    volume_digvol_meters);
