@@ -135,6 +135,7 @@ static void guest_softap_client_disconnect(Esp32WifiState *s)
     memset(s->guest_dhcp_offered_ip, 0, sizeof(s->guest_dhcp_offered_ip));
     memset(s->ipaddr, 0, sizeof(s->ipaddr));
     memset(s->ap_ipaddr, 0, sizeof(s->ap_ipaddr));
+    memset(s->softap_flows, 0, sizeof(s->softap_flows));
 }
 
 static void Esp32_WLAN_beacon_timer(void *opaque)
@@ -525,10 +526,130 @@ static bool rewrite_ipv4_address(uint8_t *packet, size_t length,
             /* A zero UDP checksum means no checksum was supplied. */
             if (protocol != IPPROTO_UDP || get_be16(checksum) != 0) {
                 checksum_replace32(checksum, old_address, new_address);
+                if (protocol == IPPROTO_UDP && get_be16(checksum) == 0) {
+                    put_be16(checksum, 0xffff);
+                }
             }
         }
     }
     memcpy(old_address, new_address, 4);
+    return true;
+}
+
+/* All forwarded hosts share the one station leased by the guest SoftAP.
+ * Remember each original host tuple so replies can be returned to SLIRP's
+ * actual TCP/UDP connection, rather than always to its loopback gateway.
+ * Translate colliding source ports as well as addresses. */
+static bool softap_translate_flow(Esp32WifiState *s, uint8_t *ip, size_t length,
+                                  bool to_guest)
+{
+    Esp32WifiSoftapFlow *flow = NULL, *unused = NULL;
+    uint8_t *transport;
+    unsigned ihl, minimum, checksum_offset;
+    uint16_t host_port, service_port, peer_port;
+    int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+
+    if (length < 20 || (ip[0] >> 4) != 4) {
+        return false;
+    }
+    ihl = (ip[0] & 15) * 4;
+    if (ihl < 20 || get_be16(ip + 2) < ihl ||
+        get_be16(ip + 2) > length) {
+        return false;
+    }
+    if (ip[9] != IPPROTO_TCP && ip[9] != IPPROTO_UDP) {
+        return true;
+    }
+    /* Port translation needs an entire transport header. Never apply a
+     * different, stateless translation to a fragment of the same flow. */
+    minimum = ip[9] == IPPROTO_TCP ? 20 : 8;
+    if ((get_be16(ip + 6) & 0x3fff) || get_be16(ip + 2) - ihl < minimum) {
+        return false;
+    }
+    transport = ip + ihl;
+    host_port = get_be16(transport);
+    service_port = get_be16(transport + 2);
+    peer_port = to_guest ? host_port : service_port;
+    if (!to_guest) {
+        service_port = host_port;
+    }
+    for (unsigned i = 0; i < ARRAY_SIZE(s->softap_flows); i++) {
+        Esp32WifiSoftapFlow *candidate = &s->softap_flows[i];
+        int64_t timeout = candidate->closing ? 30 :
+                          candidate->protocol == IPPROTO_UDP ? 60 : 300;
+
+        if (candidate->protocol &&
+            now - candidate->last_seen_ns >= timeout * NANOSECONDS_PER_SECOND) {
+            candidate->protocol = 0;
+        }
+        if (!candidate->protocol) {
+            unused = candidate;
+        } else if (candidate->protocol == ip[9] &&
+                   candidate->service_port == service_port &&
+                   (to_guest ? candidate->host_port == host_port &&
+                    !memcmp(candidate->host_ip, ip + 12, 4) :
+                    candidate->peer_port == peer_port)) {
+            flow = candidate;
+            break;
+        }
+    }
+    if (!flow) {
+        if (!to_guest || !unused) {
+            return false;
+        }
+        /* At most one candidate per existing flow can be occupied. */
+        for (unsigned tries = 0; tries <= ARRAY_SIZE(s->softap_flows); tries++) {
+            bool collision = false;
+
+            for (unsigned i = 0; i < ARRAY_SIZE(s->softap_flows); i++) {
+                Esp32WifiSoftapFlow *candidate = &s->softap_flows[i];
+
+                if (candidate->protocol == ip[9] &&
+                    candidate->service_port == service_port &&
+                    candidate->peer_port == peer_port) {
+                    collision = true;
+                    break;
+                }
+            }
+            if (!collision && peer_port) {
+                break;
+            }
+            peer_port = peer_port == UINT16_MAX ? 1 : peer_port + 1;
+        }
+        flow = unused;
+        memcpy(flow->host_ip, ip + 12, 4);
+        flow->host_port = host_port;
+        flow->peer_port = peer_port;
+        flow->service_port = service_port;
+        flow->protocol = ip[9];
+        flow->closing = false;
+    }
+    flow->last_seen_ns = now;
+    if (ip[9] == IPPROTO_TCP) {
+        if (to_guest && (transport[13] & 0x12) == 0x02) {
+            flow->closing = false;
+        }
+        if (transport[13] & 0x05) { /* FIN or RST: retain retransmissions. */
+            flow->closing = true;
+        }
+    }
+    checksum_offset = ip[9] == IPPROTO_TCP ? 16 : 6;
+    if (to_guest) {
+        peer_port = flow->peer_port;
+    } else {
+        host_port = get_be16(transport + 2);
+        peer_port = flow->host_port;
+        rewrite_ipv4_address(ip, length, 16, flow->host_ip);
+    }
+    if (ip[9] != IPPROTO_UDP || get_be16(transport + checksum_offset)) {
+        uint16_t checksum = checksum_replace16(
+            get_be16(transport + checksum_offset), host_port, peer_port);
+
+        /* A computed zero UDP checksum is encoded as 0xffff. */
+        put_be16(transport + checksum_offset,
+                 checksum || ip[9] != IPPROTO_UDP ? checksum : 0xffff);
+    }
+    put_be16(transport + (to_guest ? 0 : 2), peer_port);
     return true;
 }
 
@@ -690,7 +811,8 @@ static bool slirp_to_softap(Esp32WifiState *s, uint8_t *ethernet,
         return false;
     }
     ip = ethernet + 14;
-    if (!rewrite_ipv4_address(ip, ethernet_length - 14, 16, s->ap_ipaddr) ||
+    if (!softap_translate_flow(s, ip, ethernet_length - 14, true) ||
+        !rewrite_ipv4_address(ip, ethernet_length - 14, 16, s->ap_ipaddr) ||
         !rewrite_ipv4_address(ip, ethernet_length - 14, 12, s->ipaddr)) {
         return false;
     }
@@ -740,18 +862,23 @@ static bool slirp_softap_arp_proxy(Esp32WifiState *s, NetClientState *nc,
     return true;
 }
 
-static void softap_to_slirp(Esp32WifiState *s, uint8_t *ethernet,
+static bool softap_to_slirp(Esp32WifiState *s, uint8_t *ethernet,
                             size_t ethernet_length)
 {
     uint8_t *ip;
 
     if (!s->guest_dhcp_complete || ethernet_length < 14 ||
         get_be16(ethernet + 12) != ETH_P_IP) {
-        return;
+        return true;
     }
     ip = ethernet + 14;
+    if (!softap_translate_flow(s, ip, ethernet_length - 14, false)) {
+        return false;
+    }
     rewrite_ipv4_address(ip, ethernet_length - 14, 12, slirp_station_ip);
-    rewrite_ipv4_address(ip, ethernet_length - 14, 16, slirp_gateway_ip);
+    if (ip[9] != IPPROTO_TCP && ip[9] != IPPROTO_UDP) {
+        rewrite_ipv4_address(ip, ethernet_length - 14, 16, slirp_gateway_ip);
+    }
     if ((ip[0] >> 4) == 4 && (ip[0] & 0xf) >= 5) {
         uint8_t *transport = ip + (ip[0] & 0xf) * 4;
         uint16_t source_port = 0, destination_port = 0;
@@ -767,6 +894,7 @@ static void softap_to_slirp(Esp32WifiState *s, uint8_t *ethernet,
                                        destination_port, tcp_flags,
                                        ethernet_length);
     }
+    return true;
 }
 
 static void infoprint(struct mac80211_frame *frame) {
@@ -991,6 +1119,7 @@ void Esp32_WLAN_reset(Esp32WifiState *s)
     memset(s->guest_dhcp_xid, 0, sizeof(s->guest_dhcp_xid));
     memset(s->guest_dhcp_server_id, 0, sizeof(s->guest_dhcp_server_id));
     memset(s->guest_dhcp_offered_ip, 0, sizeof(s->guest_dhcp_offered_ip));
+    memset(s->softap_flows, 0, sizeof(s->softap_flows));
     s->guest_ssid[0] = '\0';
     s->guest_channel = 0;
     memset(s->guest_ap_macaddr, 0, sizeof(s->guest_ap_macaddr));
@@ -1537,9 +1666,10 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
                 return;
             }
 
-            if (s->guest_softap) {
-                softap_to_slirp(s, ethernet_frame,
-                                ethernet_frame_size + 14);
+            if (s->guest_softap &&
+                !softap_to_slirp(s, ethernet_frame,
+                                 ethernet_frame_size + 14)) {
+                return;
             }
 
             // send frame

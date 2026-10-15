@@ -147,6 +147,11 @@ int64_t icount_get(void)
     do {
         start = seqlock_read_begin(&timers_state.vm_clock_seqlock);
         icount = icount_get_locked();
+        /* Alignment normally permits a small lead over the host clock.
+         * Keep aligned guest clocks strictly bounded by active host time. */
+        if (icount_align_option) {
+            icount = MIN(icount, cpu_get_clock_locked());
+        }
     } while (seqlock_read_retry(&timers_state.vm_clock_seqlock, start));
 
     return icount;

@@ -20,6 +20,18 @@
 #define ESP32_WIFI_MMIO_SIZE 0x2100
 #define ESP32_WIFI_MAX_FRAME_SIZE (24 + 2316)
 
+#define ESP32_WIFI_SOFTAP_FLOWS 128
+
+typedef struct Esp32WifiSoftapFlow {
+    uint8_t host_ip[4];
+    uint16_t host_port;
+    uint16_t peer_port;
+    uint16_t service_port;
+    uint8_t protocol;
+    bool closing;
+    int64_t last_seen_ns;
+} Esp32WifiSoftapFlow;
+
 /* The ESP-IDF ESP32 libpp `hal_get_tsf_time()` helper accesses WDEV TSF
  * latch at 0x3ff75010 and snapshots two 64-bit microsecond counters at
  * 0x3ff75014/18 and 0x3ff75054/58. These addresses are within the Wi-Fi
@@ -200,6 +212,7 @@ typedef struct Esp32WifiState {
     uint8_t guest_dhcp_xid[4];
     uint8_t guest_dhcp_server_id[4];
     uint8_t guest_dhcp_offered_ip[4];
+    Esp32WifiSoftapFlow softap_flows[ESP32_WIFI_SOFTAP_FLOWS];
     char guest_ssid[33];
     uint8_t guest_channel;
 
