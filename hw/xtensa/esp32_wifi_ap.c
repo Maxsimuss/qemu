@@ -1360,7 +1360,9 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
                 }
                 if (frame_targets_peer_ap(s, frame) &&
                     s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED) {
-                    s->ap_state = Esp32_WLAN__STATE_AUTHENTICATED;
+                    /* Disassociation retains peer-AP authentication. Keep the
+                     * STA-side state so a later association is accepted. */
+                    s->ap_state = Esp32_WLAN__STATE_STA_AUTHENTICATED;
                 }
                 break;
             case IEEE80211_TYPE_MGT_SUBTYPE_DEAUTHENTICATION:

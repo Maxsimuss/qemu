@@ -1257,6 +1257,59 @@ static void guest_softap_auth_assoc_dhcp_dma(void)
     qtest_quit(q);
 }
 
+static void peer_ap_reconnect_after_disassociation(void)
+{
+    QTestState *q = qtest_init("-machine esp32,wifi-peer-ssid=test-ap,"
+                               "wifi-peer-password=test-password "
+                               "-display none -serial none "
+                               "-nic user,model=misc.esp32_wifi");
+    static const uint8_t ap[6] = {0x10,0x01,0x00,0xc4,0x0a,0x51};
+    static const uint8_t station[6] = {0x24,0x6f,0x28,0x11,0x22,0x33};
+    static const uint8_t association[] = {
+        0x31,0x04,3,0,
+        0,7,'t','e','s','t','-','a','p',
+        1,8,0x8b,0x96,0x82,0x84,0x0c,0x18,0x30,0x60,
+        48,20,1,0,0,0x0f,0xac,4,1,0,0,0x0f,0xac,4,
+        1,0,0,0x0f,0xac,2,0,0,
+        50,4,0x6c,0x12,0x24,0x48,
+    };
+    uint8_t tx[128] = {0}, rx[2048];
+    size_t received;
+
+    wifi_enable_mac(q);
+    qtest_writel(q, ESP32_WIFI_RFPLL_FREQ_BASE, 0x18 | BIT(8));
+    qtest_clock_step(q, 2000);
+    memcpy(tx + 4, ap, sizeof(ap));
+    memcpy(tx + 10, station, sizeof(station));
+    memcpy(tx + 16, ap, sizeof(ap));
+
+    for (unsigned attempt = 0; attempt < 3; attempt++) {
+        tx[0] = 0xb0; /* open-system authentication request */
+        memcpy(tx + 24, (uint8_t[]){0,0,1,0,0,0}, 6);
+        softap_transmit_frame(q, tx, 34);
+        received = softap_receive_frame(q, rx, sizeof(rx));
+        g_assert_cmpuint(received, >=, 30);
+        g_assert_cmphex(rx[0], ==, 0xb0);
+        g_assert_cmphex(rx[28] | (rx[29] << 8), ==, 0);
+
+        tx[0] = 0x00; /* WPA2 association request */
+        memcpy(tx + 24, association, sizeof(association));
+        softap_transmit_frame(q, tx, 24 + sizeof(association) + 4);
+        received = softap_receive_frame(q, rx, sizeof(rx));
+        g_assert_cmpuint(received, >=, 30);
+        g_assert_cmphex(rx[0], ==, 0x10);
+        g_assert_cmphex(rx[26] | (rx[27] << 8), ==, 0);
+
+        /* ESP-IDF disconnects by disassociation. Drain the queued WPA2 M1,
+         * then repeat authentication and association on the same channel. */
+        softap_receive_frame(q, rx, sizeof(rx));
+        tx[0] = 0xa0;
+        memcpy(tx + 24, (uint8_t[]){8,0,0,0,0,0}, 6);
+        softap_transmit_frame(q, tx, 30);
+    }
+    qtest_quit(q);
+}
+
 int main(int argc, char **argv)
 {
     g_test_init(&argc, &argv, NULL);
@@ -1302,5 +1355,7 @@ int main(int argc, char **argv)
                    guest_softap_beacon_enters_rx_dma);
     qtest_add_func("/esp32/wifi/guest-softap-auth-assoc-dhcp-dma",
                    guest_softap_auth_assoc_dhcp_dma);
+    qtest_add_func("/esp32/wifi/peer-ap-reconnect-after-disassociation",
+                   peer_ap_reconnect_after_disassociation);
     return g_test_run();
 }
