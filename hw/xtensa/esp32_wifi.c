@@ -45,6 +45,10 @@ static uint32_t esp32_wifi_rxctrl_reg(Esp32WifiState *s, hwaddr addr)
     switch (addr) {
     case ESP32_WIFI_RXCTRL_AGC_GAIN:
         return s->rxctrl_agc_gain;
+    case ESP32_WIFI_RXCTRL_BANDWIDTH:
+        return s->rxctrl_bandwidth;
+    case ESP32_WIFI_RXCTRL_PRIMARY:
+        return s->rxctrl_primary;
     case ESP32_WIFI_RXCTRL_AGC_MODE:
         return s->rxctrl_agc_mode;
     case ESP32_WIFI_RXCTRL_AGC_STATE:
@@ -84,6 +88,12 @@ static void esp32_wifi_rxctrl_write(void *opaque, hwaddr addr, uint64_t value,
     switch (addr) {
     case ESP32_WIFI_RXCTRL_AGC_GAIN:
         s->rxctrl_agc_gain = v;
+        break;
+    case ESP32_WIFI_RXCTRL_BANDWIDTH:
+        s->rxctrl_bandwidth = v;
+        break;
+    case ESP32_WIFI_RXCTRL_PRIMARY:
+        s->rxctrl_primary = v;
         break;
     case ESP32_WIFI_RXCTRL_AGC_MODE:
         s->rxctrl_agc_mode = v;
@@ -473,6 +483,21 @@ static uint8_t esp32_wifi_rfpll_channel_for_code(uint8_t code)
         return 1 + (code - 0x18) / 0x0a;
     }
     return code == 0xa8 ? 14 : 0;
+}
+
+uint8_t esp32_wifi_primary_channel(const Esp32WifiState *s)
+{
+    int channel = s->rf_channel;
+
+    if (!channel) {
+        return 0;
+    }
+    /* bb_bss_cbw40() sets C450[3:2] for HT40 and CC0C[0] for its
+     * upper primary channel (sub_chan_cfg == 3). */
+    if ((s->rxctrl_bandwidth & 0xc) == 0xc) {
+        channel += (s->rxctrl_primary & BIT(0)) ? 2 : -2;
+    }
+    return channel >= 1 && channel <= 14 ? channel : 0;
 }
 
 static void esp32_wifi_rfpll_publish(Esp32WifiState *s)
@@ -1590,7 +1615,7 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
         .sig_len_copy=length,
         .legacy_length=length,
         .noise_floor=-97,
-        .channel=s->rf_channel,
+        .channel=esp32_wifi_primary_channel(s),
         .timestamp=qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL)/1000,
     };
     /* DA match uses the two programmed local MAC slots. Broadcast is a
@@ -1700,6 +1725,8 @@ static void esp32_wifi_reset_hold(Object *obj, ResetType type)
     memset(s->crypto_rx_pn, 0, sizeof(s->crypto_rx_pn));
     memset(s->crypto_tx_pn, 0, sizeof(s->crypto_tx_pn));
     s->rxctrl_agc_gain = 0;
+    s->rxctrl_bandwidth = 0;
+    s->rxctrl_primary = 0;
     s->rxctrl_agc_mode = 0;
     s->rxctrl_agc_state = 0;
     s->rxctrl_agc_enable = 0;

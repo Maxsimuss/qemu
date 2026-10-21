@@ -46,6 +46,8 @@ typedef struct Esp32WifiSoftapFlow {
 
 /* Private ESP32 RX-control MMIO, independently observed in the IDF PHY ELF. */
 #define ESP32_WIFI_RXCTRL_BASE 0x3ff5c000
+#define ESP32_WIFI_RXCTRL_BANDWIDTH 0x450
+#define ESP32_WIFI_RXCTRL_PRIMARY 0xc0c
 #define ESP32_WIFI_RXCTRL_SIZE 0x2000
 #define ESP32_WIFI_RXCTRL_AGC_GAIN 0x01c
 #define ESP32_WIFI_RXCTRL_AGC_MODE 0x030
@@ -133,6 +135,8 @@ typedef struct Esp32WifiState {
     int64_t wdev_tsf_epoch_ns;
     bool wdev_tsf_running;
     uint32_t rxctrl_agc_gain;
+    uint32_t rxctrl_bandwidth;
+    uint32_t rxctrl_primary;
     uint32_t rxctrl_agc_mode;
     uint32_t rxctrl_agc_state;
     uint32_t rxctrl_agc_enable;
@@ -181,7 +185,7 @@ typedef struct Esp32WifiState {
     char *peer_password;
     uint8_t peer_channel;
     bool peer_multicast_to_unicast;
-    /* RF channel selected by a completed, supported C4 tune operation. */
+    /* RFPLL centre channel; HT40's primary channel is offset by two. */
     uint8_t rf_channel;
     Esp32Wpa2Peer security;
     // various timers
@@ -224,6 +228,7 @@ void Esp32_WLAN_setup_ap(DeviceState *dev,Esp32WifiState *s);
 void Esp32_WLAN_reset(Esp32WifiState *s);
 void Esp32_WLAN_cleanup(Esp32WifiState *s);
 bool esp32_wifi_mac_enabled(const Esp32WifiState *s);
+uint8_t esp32_wifi_primary_channel(const Esp32WifiState *s);
 bool esp32_wifi_mac_ccmp(Esp32WifiState *s, mac80211_frame *frame,
                          bool encrypt, uint8_t interface_id);
 void Esp32_WLAN_clock_changed(Esp32WifiState *s);

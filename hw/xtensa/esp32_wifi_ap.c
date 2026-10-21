@@ -96,7 +96,7 @@ static bool wlan_strip_valid_fcs(mac80211_frame *frame, uint8_t fcs[4])
 static bool frame_targets_peer_ap(const Esp32WifiState *s,
                                   const mac80211_frame *frame)
 {
-    if (!peer_ap.ssid || peer_ap.channel != s->rf_channel ||
+    if (!peer_ap.ssid || peer_ap.channel != esp32_wifi_primary_channel(s) ||
         frame->frame_control.type != IEEE80211_TYPE_MGT) {
         return false;
     }
@@ -127,6 +127,7 @@ static bool frame_uses_guest_ap_bssid(const Esp32WifiState *s,
 
 static void guest_softap_client_disconnect(Esp32WifiState *s)
 {
+    s->guest_softap = false;
     s->guest_ap_associated = false;
     s->guest_dhcp_complete = false;
     s->guest_dhcp_xid_active = false;
@@ -147,19 +148,16 @@ static void Esp32_WLAN_beacon_timer(void *opaque)
         return;
     }
 
-    // only send a beacon if we are an access point
-    if(s->ap_state!=Esp32_WLAN__STATE_STA_ASSOCIATED) {
-        if (peer_ap.channel == s->rf_channel && peer_ap.ssid) {
-            frame = Esp32_WLAN_create_beacon_frame(&peer_ap);
-            memcpy(s->ap_macaddr, peer_ap.mac_address, 6);
-            memcpy(frame->receiver_address, BROADCAST, 6);
-            memcpy(frame->transmitter_address, s->ap_macaddr, 6);
-            memcpy(frame->address_3, s->ap_macaddr, 6);
-            Esp32_WLAN_init_ap_frame(s, frame);
-            Esp32_WLAN_insert_frame(s, frame);
-        }
-        s->beacon_ap = 0;
+    if (peer_ap.channel == esp32_wifi_primary_channel(s) && peer_ap.ssid) {
+        frame = Esp32_WLAN_create_beacon_frame(&peer_ap);
+        memcpy(s->ap_macaddr, peer_ap.mac_address, 6);
+        memcpy(frame->receiver_address, BROADCAST, 6);
+        memcpy(frame->transmitter_address, s->ap_macaddr, 6);
+        memcpy(frame->address_3, s->ap_macaddr, 6);
+        Esp32_WLAN_init_ap_frame(s, frame);
+        Esp32_WLAN_insert_frame(s, frame);
     }
+    s->beacon_ap = 0;
     timer_mod(s->beacon_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BEACON_TIME);
 }
 
@@ -701,9 +699,7 @@ static bool is_dhcp_from_ap(mac80211_frame *frame, dhcp_t **dhcp_out,
     return true;
 }
 
-/* Learn SoftAP identity and channel from the firmware's actual transmitted
- * beacon.  This is also the only channel evidence available until the ROM
- * analog-I2C/RF path is modeled. */
+/* Track SoftAP identity and channel, including channel switches. */
 static void learn_guest_beacon(Esp32WifiState *s, const mac80211_frame *frame)
 {
     const uint8_t *ies;
@@ -961,7 +957,7 @@ static _Bool Esp32_WLAN_can_receive(NetClientState *ncs)
     }
     if (s->security.configured &&
         s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED &&
-        !s->security.keys_installed) {
+        !s->security.keys_installed && !s->guest_ap_associated) {
         return 0;
     }
 
@@ -975,6 +971,7 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
     struct mac80211_frame *frame;
     uint8_t ethernet[1518];
     uint16_t ethertype = size >= 14 ? get_be16(buf + 12) : 0;
+    bool softap = false;
     if (!Esp32_WLAN_can_receive(ncs)) {
         trace_esp32_wifi_backend_receive(s && s->guest_softap,
                                          s ? s->ap_state : 0,
@@ -996,8 +993,7 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
         return -1;
     }
     memcpy(ethernet, buf, size);
-    if (s->guest_softap && s->guest_ap_associated &&
-        s->ap_state != Esp32_WLAN__STATE_STA_ASSOCIATED) {
+    if (s->guest_softap && s->guest_ap_associated) {
         /* SLIRP host forwarding targets its virtual NIC address.  Map the
          * endpoint to the guest AP interface after the emulated station has
          * received a DHCP lease from the real guest DHCP server.
@@ -1008,7 +1004,11 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
                                              ethertype, size, true);
             return size;
         }
-        if (!slirp_to_softap(s, ethernet, size)) {
+        /* AP and STA may coexist; route by destination, not STA state. */
+        softap = !memcmp(ethernet, s->guest_ap_macaddr, 6) ||
+            (ethertype == ETH_P_IP && size >= 34 &&
+             !memcmp(ethernet + 30, slirp_station_ip, sizeof(slirp_station_ip)));
+        if (softap && !slirp_to_softap(s, ethernet, size)) {
             trace_esp32_wifi_backend_receive(s->guest_softap, s->ap_state,
                                              s->guest_dhcp_complete,
                                              ethertype, size, false);
@@ -1026,8 +1026,7 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
     frame = Esp32_WLAN_create_data_packet(s, ethernet, size);
     if (frame) {
         /* send message to ESP32 AP */
-        if (s->guest_softap && s->guest_ap_associated &&
-            s->ap_state != Esp32_WLAN__STATE_STA_ASSOCIATED) {
+        if (softap) {
             /* A QEMU NIC frame is an Ethernet frame arriving from the
              * virtual station.  On air it is a To-DS data frame. */
             frame->frame_control.to_ds = 1;
@@ -1069,7 +1068,7 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
             memcpy(frame->address_3, &buf[6], 6); // source address
         }
         Esp32_WLAN_init_ap_frame(s, frame);
-        if (s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED &&
+        if (!softap && s->ap_state == Esp32_WLAN__STATE_STA_ASSOCIATED &&
             s->security.configured) {
             const uint8_t *expected = esp32_wpa2_expected_data_key(
                 &s->security, frame->receiver_address);
@@ -1287,9 +1286,9 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
         switch(frame->frame_control.sub_type) {
             case IEEE80211_TYPE_MGT_SUBTYPE_BEACON:
                 /* A guest beacon means its own SoftAP is running. */
+                learn_guest_beacon(s, frame);
                 if (!s->guest_softap) {
                     s->guest_softap = true;
-                    learn_guest_beacon(s, frame);
                     memcpy(s->guest_ap_macaddr,
                            frame->transmitter_address, 6);
                     mac80211_frame *auth = Esp32_WLAN_create_authentication_request();
@@ -1324,8 +1323,6 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
                         s->guest_dhcp_complete = false;
                         memset(s->ipaddr, 0, sizeof(s->ipaddr));
                         memset(s->ap_ipaddr, 0, sizeof(s->ap_ipaddr));
-                        memcpy(s->associated_ap_macaddr,
-                               s->guest_ap_macaddr, 6);
                         s->guest_dhcp_complete = false;
                         s->guest_dhcp_xid_active =
                             qcrypto_random_bytes(s->guest_dhcp_xid,
