@@ -194,6 +194,18 @@ static void compare_channel(Esp32I2SChannel *a, Esp32I2SChannel *b)
     g_assert_cmpmem(&copy_a, sizeof(copy_a), &copy_b, sizeof(copy_b));
 }
 
+static void test_restore_version3(void)
+{
+    Esp32I2SState source, dest;
+    initialize(&source, true);
+    initialize(&dest, false);
+    g_assert_cmpint(roundtrip_version(&source, &dest, 3), ==, 0);
+    g_assert_cmpuint(dest.tx.analytic_sample_progress, ==, 0);
+    g_assert_cmpuint(dest.rx.analytic_sample_progress, ==, 1);
+    destroy(&source);
+    destroy(&dest);
+}
+
 static void test_restore(void)
 {
     Esp32I2SState source, dest;
@@ -277,5 +289,6 @@ int main(int argc, char **argv)
     g_test_add_func("/esp32/i2s/vmstate/restore-stream-and-timers", test_restore);
     g_test_add_func("/esp32/i2s/vmstate/reject-invalid", test_reject_invalid);
     g_test_add_func("/esp32/i2s/vmstate/restore-version1", test_restore_version1);
+    g_test_add_func("/esp32/i2s/vmstate/restore-version3", test_restore_version3);
     return g_test_run();
 }

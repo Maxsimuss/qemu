@@ -61,6 +61,13 @@ int esp32_i2s_post_load(void *opaque, int version)
         s->apll_numerator = s->apll_hz;
         s->apll_denominator = 1;
     }
+    if (version < 4) {
+        s->tx.analytic_sample_progress = 0;
+        if (s->rx.analytic_clock) {
+            s->rx.analytic_sample_progress = s->rx.analytic_paired ||
+                                             s->rx.analytic_origin_falling;
+        }
+    }
     if (!esp32_i2s_state_valid(s)) {
         return -EINVAL;
     }
@@ -157,7 +164,7 @@ static const VMStateDescription vmstate_channel = {
 };
 
 const VMStateDescription vmstate_esp32_i2s = {
-    .name = TYPE_ESP32_I2S, .version_id = 3, .minimum_version_id = 1,
+    .name = TYPE_ESP32_I2S, .version_id = 4, .minimum_version_id = 1,
     .post_load = esp32_i2s_post_load,
     .fields = (const VMStateField[]) {
         VMSTATE_UINT32_ARRAY(regs, Esp32I2SState, 64),

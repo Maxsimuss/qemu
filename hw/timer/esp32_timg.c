@@ -397,6 +397,7 @@ static void esp32_timg_timer_cb(void *opaque)
     }
 
     ts->alarm = false;
+    ts->config_reg &= ~R_TIMG_T0CONFIG_ALARM_MASK;
 
     if (ts->autoreload) {
         esp32_timg_timer_reload(ts, ns_now);
@@ -525,8 +526,7 @@ static void esp32_timg_timer_update_alarm(Esp32TimgTimerState *ts, uint64_t ns_n
     int64_t count_to_alarm = ((int64_t) ts->alarm_val - (int64_t) ts->count_base)
                                 * esp32_timg_timer_direction(ts);
     if (count_to_alarm <= 0) {
-        /* ignore overflow modulo 64 bits */
-        timer_del(&ts->alarm_timer);
+        timer_mod_anticipate_ns(&ts->alarm_timer, ns_now);
         return;
     }
 

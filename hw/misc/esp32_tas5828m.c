@@ -2,8 +2,8 @@
  * Virtual TI TAS5828M Class-D amplifier for ESP32 board tests.
  *
  * Control port: TAS5828M datasheet SLASEX7 (DIE_ID 0x95; note TI E2E reports
- * silicon reading 0x98, same as TAS5830).
- * DSP data path: TAS5827/TAS5828M/TAS5830 Process Flows SLUUDB4, Process
+ * silicon reading 0x98).
+ * DSP data path: TAS5828M Process Flows SLUUDB4, Process
  * Flow 1 (48 kHz stereo): SDIN -> input mixer -> 12 BQs/channel -> volume.
  *
  * The device is an electrical peer. It never touches the ESP32 I2C or I2S
@@ -540,7 +540,7 @@ static void update_measurements(Esp32Tas5828m *s, uint32_t rate_hz,
         }
     }
     if (fs_cfg) {
-        /* TAS5828M manual codes (0100/0010 reserved, unlike TAS5830). */
+        /* TAS5828M manual codes (0100/0010 reserved). */
         uint32_t expect_hz = 0xFFFFFFFF;
         switch (fs_cfg) {
         case 0x6: expect_hz = 32000; break;

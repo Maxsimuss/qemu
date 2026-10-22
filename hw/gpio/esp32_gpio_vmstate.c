@@ -73,6 +73,7 @@ static int gpio_post_load(void *opaque, int version)
     }
     s->resolving = false;
     s->pending_pads = 0;
+    s->pending_analytic_pads = 0;
     s->pending_all_inputs = false;
     esp32_gpio_rebuild_outputs(s);
     return 0;

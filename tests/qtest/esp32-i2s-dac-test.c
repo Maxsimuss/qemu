@@ -702,7 +702,7 @@ static void i2s_write(QTestState *q, unsigned offset, uint32_t value)
  * Fs = 16.03 kHz (0.16% from 16 kHz). MCLK is not routed: the DAC measures
  * the frame rate from WS edges and the BCLK count per frame.
  */
-static void real_i2s_run(bool trace)
+static void real_i2s_run(bool trace, bool reroute)
 {
     g_autofree char *trace_path = NULL;
     g_autofree char *machine_args = NULL;
@@ -749,7 +749,17 @@ static void real_i2s_run(bool trace)
     i2s_write(q, 0x20, qtest_readl(q, I2S0 + 0x20) | (1 << 12));
     i2s_write(q, 0x30, (DESC & 0xfffff) | (1 << 29));
     i2s_write(q, 0x08, (1 << 4) | (1 << 10));
-    qtest_clock_step(q, 70000 * (N + 3));
+    unsigned elapsed = 0;
+    if (reroute) {
+        for (unsigned i = 0; i < 100; i++) {
+            qtest_clock_step(q, 1237);
+            elapsed += 1237;
+            /* Live edits keep the same physical audio wiring. */
+            qtest_writel(q, MUX + 0x70, (2 << 12) | (1 << 9));
+            qtest_writel(q, GPIO + 0x530 + PAD_DATA * 4, 163);
+        }
+    }
+    qtest_clock_step(q, 70000 * (N + 3) - elapsed);
 
     /* Burst 2: the clock stalled after burst 1; restart through the FIFO. */
     for (unsigned i = N; i < N + M; i++) {
@@ -799,7 +809,7 @@ static void real_i2s_run(bool trace)
 
 static void real_i2s(void)
 {
-    real_i2s_run(false);
+    real_i2s_run(false, false);
 }
 
 static void real_i2s_trace(void)
@@ -808,7 +818,12 @@ static void real_i2s_trace(void)
      * With full pad tracing enabled, the same physical DAC switches to the
      * timestamped edge path and must capture the identical DMA sample stream.
      */
-    real_i2s_run(true);
+    real_i2s_run(true, false);
+}
+
+static void real_i2s_live_routing(void)
+{
+    real_i2s_run(false, true);
 }
 
 static void real_i2s_wrong_physical_route(void)
@@ -838,22 +853,17 @@ static void real_i2s_wrong_physical_route(void)
 
 /*
  * One virtual second of 48 kHz, 32-bit stereo TX through the physical GPIO
- * matrix into both TAS observers and the recording DAC.  The DMA burst is
+ * matrix into two TAS5828M observers and the recording DAC. The DMA burst is
  * intentionally finite; after its EOF the real I2S underrun rule replays the
  * last frame, giving the WAV a simple golden tail.
  */
 static void analytic_audio_second(void)
 {
-    if (!qtest_has_device("esp32-tas5828m") ||
-        !qtest_has_device("esp32-tas5830")) {
-        g_test_skip("optional TAS models are not built in this QEMU tree");
-        return;
-    }
     g_autofree char *devices = g_strdup(
         "-device esp32-tas5828m,gpio=/machine/soc/gpio,address=0x61,"
         "driver-slot=2,sda=21,scl=22,bclk=18,ws=19,data=23 "
-        "-device esp32-tas5830,gpio=/machine/soc/gpio,address=0x62,"
-        "driver-slot=3");
+        "-device esp32-tas5828m,gpio=/machine/soc/gpio,address=0x62,"
+        "driver-slot=3,sda=21,scl=22,bclk=18,ws=19,data=23");
     Dut d = dut_start(NULL, devices);
     QTestState *q = d.q;
     const unsigned burst_frames = 511;
@@ -991,6 +1001,8 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/i2s-dac/size-limit", size_limit);
     qtest_add_func("/esp32/i2s-dac/real-i2s0", real_i2s);
     qtest_add_func("/esp32/i2s-dac/real-i2s0-trace", real_i2s_trace);
+    qtest_add_func("/esp32/i2s-dac/real-i2s0-live-routing",
+                   real_i2s_live_routing);
     qtest_add_func("/esp32/i2s-dac/real-i2s0-wrong-route",
                    real_i2s_wrong_physical_route);
     qtest_add_func("/esp32/i2s-dac/analytic-audio-second",

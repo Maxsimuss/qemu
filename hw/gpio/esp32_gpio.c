@@ -34,6 +34,7 @@
 #define IOMUX_IE BIT(9)
 
 static void routing_changed(Esp32GpioState *s);
+static void routing_will_change(Esp32GpioState *s);
 #define IOMUX_PU BIT(8)
 #define IOMUX_PD BIT(7)
 #define PAD_VALID UINT64_C(0xff0eefffff)
@@ -405,6 +406,8 @@ static void gpio_resolve_pads(Esp32GpioState *s, uint64_t pads, bool all_inputs)
     bool status_changed = false;
 
     s->pending_pads |= pads;
+    s->pending_analytic_pads = (s->pending_analytic_pads & ~pads) |
+                               (s->materializing_analytic ? pads : 0);
     s->pending_all_inputs |= all_inputs;
     if (s->resolving || (!s->pending_pads && !s->pending_all_inputs)) {
         return;
@@ -413,8 +416,10 @@ static void gpio_resolve_pads(Esp32GpioState *s, uint64_t pads, bool all_inputs)
     do {
         uint64_t inputs[ESP32_GPIO_SIGNALS / 64] = {0};
         uint64_t pending = s->pending_pads;
+        uint64_t analytic_pads = s->pending_analytic_pads;
         bool refresh_inputs = s->pending_all_inputs;
         s->pending_pads = 0;
+        s->pending_analytic_pads = 0;
         s->pending_all_inputs = false;
         cache_routes(s);
         while (pending) {
@@ -492,7 +497,7 @@ static void gpio_resolve_pads(Esp32GpioState *s, uint64_t pads, bool all_inputs)
                 for (unsigned i = 0; listeners && i < listeners->len; i++) {
                     qemu_irq sink = g_ptr_array_index(listeners, i);
                     bool analytic = false;
-                    if (s->materializing_analytic) {
+                    if (analytic_pads & (UINT64_C(1) << pad)) {
                         GPtrArray *observers = s->analytic_pad_listeners[pad];
                         for (unsigned j = 0; observers &&
                              j < observers->len; j++) {
@@ -678,7 +683,7 @@ static void gpio_materialize_analytic_clock_pads(Esp32GpioState *s,
             uint64_t remainder;
 
             if (!s->analytic_clock[signal] ||
-                !(s->output_pads[signal] & pads)) {
+                (s->output_pads[signal] && !(s->output_pads[signal] & pads))) {
                 continue;
             }
             esp32_gpio_analytic_clock_state(s, signal, now, &level,
@@ -764,15 +769,10 @@ void esp32_gpio_set_external_drive(Esp32GpioState *s, unsigned pad,
     gpio_materialize_analytic_clock_pads(s, UINT64_C(1) << pad);
     unsigned index = driver * ESP32_GPIO_PADS + pad;
     if (s->external[index] != level) {
+        routing_will_change(s);
         s->external[index] = level;
         gpio_resolve_pads(s, UINT64_C(1) << pad, false);
-        for (unsigned signal = 0; signal < ESP32_GPIO_OUTPUTS; signal++) {
-            if (s->analytic_clock[signal] &&
-                (s->output_pads[signal] & (UINT64_C(1) << pad))) {
-                routing_changed(s);
-                break;
-            }
-        }
+        routing_changed(s);
     }
 }
 
@@ -788,8 +788,10 @@ void esp32_gpio_set_board_pull(Esp32GpioState *s, unsigned pad, bool pull)
     assert(pad < ESP32_GPIO_PADS);
     gpio_materialize_analytic_clock_pads(s, UINT64_C(1) << pad);
     if (!!s->board_pull[pad] != pull) {
+        routing_will_change(s);
         s->board_pull[pad] = pull;
         gpio_resolve_pads(s, UINT64_C(1) << pad, false);
+        routing_changed(s);
     }
 }
 
@@ -798,6 +800,7 @@ static void gpio_add_pad_listener(Esp32GpioState *s, unsigned pad,
 {
     assert(valid_pad(pad));
     gpio_materialize_analytic_clock_pads(s, UINT64_C(1) << pad);
+    routing_will_change(s);
     if (!s->pad_listeners[pad]) {
         s->pad_listeners[pad] = g_ptr_array_new();
     }
@@ -827,6 +830,7 @@ void esp32_gpio_remove_pad_listener(Esp32GpioState *s, unsigned pad, qemu_irq si
 {
     assert(valid_pad(pad));
     if (s->pad_listeners[pad]) {
+        routing_will_change(s);
         g_ptr_array_remove(s->pad_listeners[pad], sink);
         if (s->analytic_pad_listeners[pad]) {
             g_ptr_array_remove(s->analytic_pad_listeners[pad], sink);
@@ -1104,6 +1108,7 @@ void esp32_gpio_add_serial_frame_observer(Esp32GpioState *s,
     observer->data_pad = data_pad;
     observer->callback = callback;
     observer->opaque = opaque;
+    routing_will_change(s);
     g_ptr_array_add(s->serial_frame_observers, observer);
     routing_changed(s);
 }
@@ -1117,7 +1122,9 @@ void esp32_gpio_remove_serial_frame_observer(Esp32GpioState *s,
         Esp32SerialFrameObserver *observer =
             g_ptr_array_index(s->serial_frame_observers, i);
         if (observer->callback == callback && observer->opaque == opaque) {
+            routing_will_change(s);
             g_ptr_array_remove_index(s->serial_frame_observers, i);
+            routing_changed(s);
             return;
         }
     }
@@ -1182,7 +1189,14 @@ void esp32_gpio_publish_serial_frame(Esp32GpioState *s,
 static void routing_changed(Esp32GpioState *s)
 {
     for (unsigned i = 0; s->routing_listeners && i < s->routing_listeners->len; i++) {
-        qemu_irq_pulse(g_ptr_array_index(s->routing_listeners, i));
+        qemu_set_irq(g_ptr_array_index(s->routing_listeners, i), 1);
+    }
+}
+
+static void routing_will_change(Esp32GpioState *s)
+{
+    for (unsigned i = 0; s->routing_listeners && i < s->routing_listeners->len; i++) {
+        qemu_set_irq(g_ptr_array_index(s->routing_listeners, i), 0);
     }
 }
 
@@ -1241,6 +1255,7 @@ static void esp32_gpio_write(void *opaque, hwaddr addr, uint64_t value, unsigned
     uint32_t mask;
 
     gpio_materialize_analytic_clocks(s);
+    routing_will_change(s);
     switch (addr) {
     case GPIO_OUT: case GPIO_OUT1:
     case GPIO_ENABLE: case GPIO_ENABLE1:
@@ -1274,6 +1289,7 @@ static void esp32_gpio_write(void *opaque, hwaddr addr, uint64_t value, unsigned
         return;
     }
     gpio_resolve(s);
+    routing_changed(s);
 }
 
 static uint64_t mux_read(void *opaque, hwaddr addr, unsigned size)
@@ -1303,6 +1319,7 @@ static void mux_write(void *opaque, hwaddr addr, uint64_t value, unsigned size)
                       BIT(0) | BIT(2) | BIT(3) | (3 << 5));
         }
     }
+    routing_will_change(s);
     s->mux[addr / 4] = value & mask;
     if (addr == 0) {
         esp32_gpio_set_apll_clkout(s, s->apll_clkout_num,

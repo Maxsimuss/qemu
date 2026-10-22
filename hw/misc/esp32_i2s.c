@@ -76,6 +76,7 @@ static bool rx_analytic_tx_slave(Esp32I2SState *s);
 static void tx_analytic_to_edges(Esp32I2SState *s, int64_t now);
 static bool rx_analytic_eligible(Esp32I2SState *s);
 static void rx_analytic_to_edges(Esp32I2SState *s, int64_t now);
+static void rx_analytic_until(Esp32I2SState *s, int64_t now);
 
 static void capability_gap(Esp32I2SState *s, unsigned flag, const char *detail)
 {
@@ -856,6 +857,35 @@ static void tx_analytic_patterns(Esp32I2SState *s, int64_t origin,
         origin, data_levels, count * 2, half_num, half_den, remainder);
 }
 
+static void tx_analytic_publish_until(Esp32I2SState *s, int64_t now)
+{
+    Esp32I2SChannel *c = &s->tx;
+    unsigned first = c->analytic_sample_progress;
+    uint64_t den = c->analytic_frame_half_den;
+    uint64_t spacing = 2 * c->analytic_frame_half_num;
+
+    if (!c->analytic_frame_pending || !den || !spacing ||
+        now < c->analytic_frame_origin) {
+        return;
+    }
+    __uint128_t limit = ((__uint128_t)(now - c->analytic_frame_origin) + 1) *
+                        den - 1;
+    __uint128_t count = limit < c->analytic_frame_remainder ? 0 :
+        (limit - c->analytic_frame_remainder) / spacing + 1;
+    unsigned end = MIN(count, c->analytic_frame_count);
+    if (end <= first) {
+        return;
+    }
+    __uint128_t ticks = (__uint128_t)first * spacing +
+                        c->analytic_frame_remainder;
+    esp32_gpio_publish_serial_frame(s->gpio, signal_bck(s, true),
+        signal_ws(s, true), signal_data(s, true), c->analytic_frame_data >> first,
+        c->analytic_frame_ws >> first, end - first,
+        c->analytic_frame_origin + ticks / den, c->analytic_frame_half_num,
+        den, ticks % den);
+    c->analytic_sample_progress = end;
+}
+
 static bool tx_analytic_frame_start(Esp32I2SState *s, int64_t now,
                                     unsigned divider)
 {
@@ -878,7 +908,10 @@ static bool tx_analytic_frame_start(Esp32I2SState *s, int64_t now,
                             &ws_levels, false);
     c->analytic_frame_count = count;
     c->analytic_frame_pending = true;
-    s->rx.analytic_sample_progress = 0;
+    c->analytic_sample_progress = 0;
+    if (!master(s, false)) {
+        s->rx.analytic_sample_progress = 0;
+    }
     c->clock_level = true;
     tx_analytic_patterns(s, now, half_num, half_den, c->clock_remainder,
                          count, data_levels, ws_levels, false);
@@ -910,13 +943,7 @@ static bool tx_analytic_frame_end(Esp32I2SState *s, int64_t now,
     uint64_t half_num, half_den;
     __uint128_t data_levels, ws_levels;
 
-    if (c->analytic_frame_pending) {
-        esp32_gpio_publish_serial_frame(s->gpio, signal_bck(s, true),
-            signal_ws(s, true), signal_data(s, true), c->analytic_frame_data,
-            c->analytic_frame_ws, c->analytic_frame_count,
-            c->analytic_frame_origin, c->analytic_frame_half_num,
-            c->analytic_frame_half_den, c->analytic_frame_remainder);
-    }
+    tx_analytic_publish_until(s, now);
     c->analytic_frame_pending = false;
     c->clock_level = false;
     c->bit = 0;
@@ -948,7 +975,10 @@ static bool tx_analytic_frame_end(Esp32I2SState *s, int64_t now,
     c->analytic_frame_count = tx_frame_values(s, &c->analytic_frame_data,
         &c->analytic_frame_ws, &data_levels, &ws_levels, true);
     c->analytic_frame_pending = true;
-    s->rx.analytic_sample_progress = 0;
+    c->analytic_sample_progress = 0;
+    if (!master(s, false)) {
+        s->rx.analytic_sample_progress = 0;
+    }
     tx_analytic_patterns(s, now, half_num, half_den, c->clock_remainder,
                          c->analytic_frame_count, data_levels, ws_levels,
                          true);
@@ -978,10 +1008,14 @@ static void tx_clock(void *opaque)
         !esp32_i2s_mode_supported(s)) {
         return;
     }
-    bool frame_analytic = tx_analytic_eligible(s);
+    bool frame_analytic = tx_analytic_eligible(s) &&
+                          (c->analytic_clock ||
+                           (!c->clock_level && c->bit == 1));
     if (frame_analytic) {
         bool ok;
-        s->rx.analytic_paired = rx_analytic_tx_slave(s);
+        if (!master(s, false)) {
+            s->rx.analytic_paired = rx_analytic_tx_slave(s);
+        }
         if (c->analytic_clock && c->analytic_frame_pending) {
             ok = tx_analytic_frame_end(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
                                        divider);
@@ -1060,7 +1094,7 @@ static void rx_analytic_slave_until(Esp32I2SState *s, int64_t now,
     unsigned din = (s->controller ? 166 : 140) + 15;
     uint64_t spacing_num = tx->analytic_frame_half_num * 2;
     uint64_t den = tx->analytic_frame_half_den;
-    if (!s->rx.analytic_paired || !tx->analytic_frame_pending ||
+    if (master(s, false) || !s->rx.analytic_paired || !tx->analytic_frame_pending ||
         !spacing_num || !den || now < tx->analytic_frame_origin) {
         return;
     }
@@ -1106,7 +1140,6 @@ static void rx_clock(void *opaque)
         uint64_t half_num, half_den;
         bool first_frame = !c->analytic_clock;
         bool finishing_frame = c->analytic_frame_pending;
-        bool first_cycle = !c->analytic_origin_falling;
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         __uint128_t ws_levels = 0;
         bool level = c->clock_level;
@@ -1121,48 +1154,9 @@ static void rx_clock(void *opaque)
         }
         c->analytic_clock = true;
         if (finishing_frame) {
-            unsigned transitions = c->analytic_paired && first_cycle ?
-                                   half_edges - 2 :
-                                   (first_cycle ? half_edges - 1 : half_edges);
-
-            /*
-             * Fold the serial samples at their last-sample timestamp.  This
-             * preserves FIFO, descriptor and IRQ timing without per-bit GPIO
-             * events.  DIN is either time-sampled from the paired analytic
-             * wire or resolved once when the selected physical input is
-             * stable; GPIO input changes revoke this mode before sampling.
-             */
-            if (!c->analytic_paired) {
-                s->input_level[4] = esp32_gpio_get_input_level(s->gpio,
-                    (s->controller ? 166 : 140) + 15);
-            }
-            for (unsigned edge = 0; edge < transitions; edge++) {
-                c->clock_level = !c->clock_level;
-                if (c->clock_level) {
-                    if (c->analytic_paired) {
-                        __uint128_t elapsed = (__uint128_t)(edge + 1) *
-                            half_num + c->analytic_frame_remainder;
-                        int64_t sample_time = c->analytic_frame_origin +
-                            (elapsed + half_den - 1) / half_den;
-                        s->input_level[4] = esp32_gpio_get_input_level_at(
-                            s->gpio, (s->controller ? 166 : 140) + 15,
-                            sample_time);
-                        s->tx.ws_level = esp32_gpio_get_input_level_at(
-                            s->gpio, signal_ws(s, false), sample_time);
-                    }
-                    rx_rising(s);
-                    c->clock_bit = (c->clock_bit + 1) % (2 * bits);
-                } else {
-                    unsigned shifted = !!(REG(s, CONF) & BIT(11));
-                    unsigned right_first = !!(REG(s, CONF) & BIT(9));
-                    c->ws_level = (REG(s, CONF) & BIT(13)) ?
-                        ((c->clock_bit + shifted) % (2 * bits) == 0) :
-                        (((c->clock_bit + shifted) / bits) & 1) ^ right_first;
-                }
-            }
+            rx_analytic_until(s, now);
             c->analytic_origin_falling = true;
             c->analytic_frame_pending = false;
-            first_cycle = false;
             level = c->clock_level;
             ws = c->ws_level;
             clock_bit = c->clock_bit;
@@ -1172,6 +1166,7 @@ static void rx_clock(void *opaque)
         c->analytic_frame_remainder = c->clock_remainder;
         c->analytic_frame_half_num = half_num;
         c->analytic_frame_half_den = half_den;
+        c->analytic_sample_progress = first_frame ? 0 : 1;
 
         /*
          * Describe the next physical frame from the current resolved phase.
@@ -1183,6 +1178,7 @@ static void rx_clock(void *opaque)
             clock_bit = (clock_bit + 1) % (2 * bits);
             if (c->analytic_paired) {
                 c->clock_level = true;
+                c->analytic_sample_progress = 1;
                 c->clock_bit = clock_bit;
                 s->input_level[4] = esp32_gpio_get_input_level_at(s->gpio,
                     (s->controller ? 166 : 140) + 15, now);
@@ -1259,32 +1255,33 @@ static void input_changed(void *opaque, int n, int level)
 {
     Esp32I2SState *s = opaque;
     if (n == 24) {
-        if (s->tx.analytic_clock) {
-            tx_analytic_to_edges(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-        }
-        if (s->rx.analytic_clock) {
-            rx_analytic_to_edges(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
-        }
         if (level) {
             i2s_update(s);
+        } else {
+            int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+            tx_analytic_publish_until(s, now);
+            rx_analytic_until(s, now);
+            rx_analytic_slave_until(s, now, s->input_level[4]);
         }
         return;
     }
     unsigned old = s->input_level[n];
-    if (n == 4 && s->rx.analytic_paired && s->tx.analytic_clock) {
-        /* A newly driven DIN pad ends the stable-input interval.  Materialize
-         * the clock through this timestamp while the old DIN level is still
-         * visible; subsequent samples use the edge-driven path. */
+    if (n == 4 && !master(s, false) && s->rx.analytic_paired &&
+        s->tx.analytic_clock) {
+        /* Commit the old DIN interval before adopting the new input. */
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         rx_analytic_slave_until(s, now, old);
-        tx_analytic_to_edges(s, now);
+        if (!rx_analytic_tx_slave(s)) {
+            tx_analytic_to_edges(s, now);
+        }
     }
     if (n == 4 && s->rx.analytic_clock) {
-        /*
-         * Preserve the prior stable DIN level through this timestamp before
-         * the changed level becomes visible to the edge-scheduled receiver.
-         */
-        rx_analytic_to_edges(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+        /* A new static input can keep the current clock waveform. */
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        rx_analytic_until(s, now);
+        if (!rx_analytic_eligible(s)) {
+            rx_analytic_to_edges(s, now);
+        }
     }
     s->input_level[n] = !!level;
     if (n == 0 && (REG(s, 0x1c) & BIT(24))) {
@@ -1406,13 +1403,9 @@ static bool rx_analytic_eligible(Esp32I2SState *s)
            (paired || static_din);
 }
 
-static void rx_analytic_to_edges(Esp32I2SState *s, int64_t now)
+static void rx_analytic_until(Esp32I2SState *s, int64_t now)
 {
     Esp32I2SChannel *c = &s->rx;
-    unsigned signals[] = { signal_bck(s, false), signal_ws(s, false) };
-    bool *levels[] = { &c->clock_level, &c->ws_level };
-    int64_t next_edge = now;
-    uint64_t next_remainder = c->clock_remainder;
 
     if (c->analytic_clock && c->analytic_frame_pending &&
         c->analytic_frame_half_num && c->analytic_frame_half_den &&
@@ -1426,9 +1419,8 @@ static void rx_analytic_to_edges(Esp32I2SState *s, int64_t now)
                           c->analytic_frame_half_num;
         }
         unsigned bits = sample_bits(s, false);
-        bool first_cycle = !c->analytic_origin_falling;
-        __uint128_t edge = first_cycle ? 0 : 1;
-        for (; edge <= transitions; edge++) {
+        for (unsigned edge = c->analytic_sample_progress;
+             edge <= transitions; edge++) {
             c->clock_level = !c->clock_level;
             if (c->clock_level) {
                 if (c->analytic_paired) {
@@ -1453,9 +1445,20 @@ static void rx_analytic_to_edges(Esp32I2SState *s, int64_t now)
                     ((c->clock_bit + shifted) % (2 * bits) == 0) :
                     (((c->clock_bit + shifted) / bits) & 1) ^ right_first;
             }
+            c->analytic_sample_progress = edge + 1;
         }
-        c->analytic_origin_falling = true;
     }
+}
+
+static void rx_analytic_to_edges(Esp32I2SState *s, int64_t now)
+{
+    Esp32I2SChannel *c = &s->rx;
+    unsigned signals[] = { signal_bck(s, false), signal_ws(s, false) };
+    bool *levels[] = { &c->clock_level, &c->ws_level };
+    int64_t next_edge = now;
+    uint64_t next_remainder = c->clock_remainder;
+
+    rx_analytic_until(s, now);
     c->analytic_clock = false;
     c->analytic_frame_pending = false;
     c->analytic_paired = false;
@@ -1495,6 +1498,7 @@ static void tx_analytic_to_edges(Esp32I2SState *s, int64_t now)
     int64_t next_edge = now;
     uint64_t next_remainder = c->clock_remainder;
 
+    tx_analytic_publish_until(s, now);
     c->analytic_clock = false;
     if (s->rx.analytic_paired && !master(s, false)) {
         s->rx.analytic_paired = false;
@@ -1548,7 +1552,10 @@ static void tx_analytic_to_edges(Esp32I2SState *s, int64_t now)
 static void i2s_update(Esp32I2SState *s)
 {
     int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-    if (s->tx.analytic_clock && !tx_analytic_eligible(s)) {
+    if (s->tx.analytic_clock &&
+        (!tx_analytic_eligible(s) ||
+         (s->rx.analytic_paired && !master(s, false) &&
+          !rx_analytic_tx_slave(s)))) {
         tx_analytic_to_edges(s, now);
     }
     if (s->rx.analytic_clock && !rx_analytic_eligible(s)) {
@@ -1642,7 +1649,7 @@ static void i2s_update(Esp32I2SState *s)
             if (clock_step(s, divider, &c->clock_remainder, &c->deadline)) {
                 timer_mod_ns(c->timer, c->deadline);
             }
-        } else if (!master(s, tx)) {
+        } else if (!master(s, tx) && (tx || !c->analytic_paired)) {
             timer_del(c->timer);
         }
     }

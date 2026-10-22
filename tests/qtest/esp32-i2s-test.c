@@ -91,6 +91,44 @@ static void tx_format(gconstpointer data)
     qtest_quit(b.q);
 }
 
+static void tx_live_routing(gconstpointer data)
+{
+    TestBus b = setup(GPOINTER_TO_UINT(data), true, NULL);
+    unsigned bclk = b.port ? 24 : 23;
+    unsigned dout = b.port ? 189 : 163;
+    const uint32_t word = 0xa55ac33c;
+    const unsigned times[] = {375, 625, 999, 1000, 7123, 8001, 15374};
+    int64_t start = qtest_clock_step(b.q, 0);
+    unsigned elapsed = 0;
+
+    write_reg(&b, 0x00, word);
+    write_reg(&b, 0xa0, 0x89);
+    write_reg(&b, 0x08, 1 << 4);
+    for (unsigned i = 0; i < G_N_ELEMENTS(times); i++) {
+        qtest_clock_step(b.q, times[i] - elapsed);
+        elapsed = times[i];
+        /* Remove the only BCLK route, then attach it to a different pad. */
+        qtest_writel(b.q, GPIO + 0x530 + CLK * 4, 256 | (1 << 10));
+        qtest_writel(b.q, MUX + 0x28, (2 << 12) | (1 << 9));
+        qtest_writel(b.q, GPIO + 0x530 + 26 * 4, bclk | (1 << 9));
+        g_assert_cmpint(pin(&b, 26), ==, !((elapsed / 250) & 1));
+        qtest_writel(b.q, MUX + 0x28, 1 << 9);
+        qtest_writel(b.q, MUX + 0x28, (2 << 12) | (1 << 9));
+        g_assert_cmpint(pin(&b, 26), ==, !((elapsed / 250) & 1));
+        qtest_writel(b.q, GPIO + 0x530 + 26 * 4, 256 | (1 << 10));
+        qtest_writel(b.q, GPIO + 0x530 + CLK * 4, bclk);
+        qtest_writel(b.q, GPIO + 0x530 + SD * 4, dout);
+        g_assert_cmpint(pin(&b, CLK), ==, (elapsed / 250) & 1);
+        g_assert_cmpint(pin(&b, WS), ==, elapsed >= 8000);
+        g_assert_cmpint(pin(&b, SD), ==, (word >> (31 - elapsed / 500)) & 1);
+    }
+    /* Routing edits must leave the frame timer intact, without edge timers. */
+    g_assert_cmpint(qtest_clock_step_next(b.q), ==, start + 16000);
+    g_assert_false(pin(&b, CLK));
+    check_frame(&b, word, false);
+    qtest_quit(b.q);
+}
+
 static void external(TestBus *b, unsigned pad, bool value)
 {
     qtest_set_irq_in(b->q, "/machine/soc/gpio", "pad-drive", pad, value);
@@ -726,6 +764,29 @@ static void receive_master(gconstpointer data)
     qtest_quit(b.q);
 }
 
+static void rx_live_routing(gconstpointer data)
+{
+    TestBus b = setup(GPOINTER_TO_UINT(data), false, NULL);
+    unsigned din = b.port ? 181 : 155;
+    unsigned bclk = b.port ? 164 : 27;
+    int64_t start = qtest_clock_step(b.q, 0);
+
+    qtest_writel(b.q, GPIO + 0x130 + din * 4, 0x38 | 128);
+    qtest_writel(b.q, GPIO + 0x130 + bclk * 4, 0x30 | 128);
+    qtest_writel(b.q, GPIO + 0x130 + (b.port ? 165 : 28) * 4, 0x30 | 128);
+    qtest_writel(b.q, GPIO + 0x530 + CLK * 4, bclk);
+    write_reg(&b, 0x08, 1 << 5);
+    qtest_clock_step(b.q, 4123); /* Eight samples have seen the old input. */
+    qtest_writel(b.q, GPIO + 0x130 + din * 4, 0x30 | 128);
+    qtest_writel(b.q, MUX + 0x70, 1 << 9);
+    qtest_clock_step(b.q, 1000);
+    qtest_writel(b.q, MUX + 0x70, (2 << 12) | (1 << 9));
+    g_assert_false(pin(&b, CLK));
+    g_assert_cmpint(qtest_clock_step_next(b.q), ==, start + 15750);
+    g_assert_cmphex(read_reg(&b, 0x04), ==, 0xff000000);
+    qtest_quit(b.q);
+}
+
 /*
  * In analytic mode RX retires the frame at its final sample edge, keeping
  * DMA ownership and EOF timing aligned with the bit-clock waveform.
@@ -833,6 +894,65 @@ static void rx_transition_din_duplex(gconstpointer data)
     qtest_quit(b.q);
 }
 
+static void rx_slave_live_update(gconstpointer data)
+{
+    unsigned port = GPOINTER_TO_UINT(data) & 1;
+    unsigned change = GPOINTER_TO_UINT(data) >> 1;
+    TestBus b = setup(port, true, NULL);
+    unsigned rx_bck = port ? 164 : 27;
+    unsigned rx_ws = port ? 165 : 28;
+    unsigned rx_din = port ? 181 : 155;
+    uint32_t owned = (1u << 31) | (4 << 12) | 4;
+
+    qtest_writel(b.q, GPIO + 0x130 + rx_bck * 4, CLK | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_ws * 4, WS | 128);
+    qtest_writel(b.q, GPIO + 0x130 + rx_din * 4, 0x38 | 128);
+    qtest_writel(b.q, MUX + 0x80, (2 << 12) | (1 << 9));
+    external(&b, 22, false);
+    write_reg(&b, 0x00, 0x12345678);
+    qtest_writel(b.q, DESC, owned);
+    qtest_writel(b.q, DESC + 4, DATA);
+    qtest_writel(b.q, DESC + 8, 0);
+    qtest_writel(b.q, DATA, 0xa5a5a5a5);
+    write_reg(&b, 0x60, 1 << 12);
+    write_reg(&b, 0x24, 3);
+    write_reg(&b, 0x20, read_reg(&b, 0x20) | (1 << 12));
+    write_reg(&b, 0x34, (DESC & 0xfffff) | (1 << 29));
+    write_reg(&b, 0x08, (1 << 4) | (1 << 5) | (1 << 7) | (1 << 18));
+
+    qtest_clock_step(b.q, 8000);
+    switch (change) {
+    case 0:
+        qtest_writel(b.q, MUX + 0x70, (2 << 12) | (1 << 9));
+        qtest_writel(b.q, GPIO + 0x130 + rx_bck * 4, CLK | 128);
+        qtest_writel(b.q, GPIO + 0x04, 0);
+        qtest_writel(b.q, GPIO + 0x4c, UINT32_MAX);
+        break;
+    case 1:
+        qtest_writel(b.q, GPIO + 0x130 + rx_din * 4, 0x30 | 128);
+        break;
+    case 2:
+        qtest_writel(b.q, GPIO + 0x130 + rx_din * 4, 22 | 128);
+        break;
+    case 3:
+        write_reg(&b, 0x08, (1 << 4) | (1 << 7) | (1 << 18));
+        qtest_clock_step(b.q, 40000);
+        g_assert_cmphex(qtest_readl(b.q, DESC), ==, owned);
+        g_assert_cmphex(qtest_readl(b.q, DATA), ==, 0xa5a5a5a5);
+        g_assert_cmphex(read_reg(&b, 0x0c) & (1 << 9), ==, 0);
+        qtest_quit(b.q);
+        return;
+    }
+    qtest_clock_step(b.q, 7749);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==, owned);
+    g_assert_cmphex(qtest_readl(b.q, DATA), ==, 0xa5a5a5a5);
+    qtest_clock_step(b.q, 1);
+    g_assert_cmphex(qtest_readl(b.q, DESC), ==, owned & ~(1u << 31));
+    g_assert_cmphex(qtest_readl(b.q, DATA), ==,
+                    change == 0 ? 0xffffffff : 0xffff0000);
+    qtest_quit(b.q);
+}
+
 static void channel_selection(gconstpointer data)
 {
     TestBus b = setup(GPOINTER_TO_UINT(data), true, NULL);
@@ -926,6 +1046,9 @@ int main(int argc, char **argv)
         g_autofree char *rxdma = g_strdup_printf("/esp32/i2s%u/rx-dma", port);
         g_test_add_data_func(msb, GUINT_TO_POINTER(port), tx_format);
         g_test_add_data_func(philips, GUINT_TO_POINTER(port | 2), tx_format);
+        g_autofree char *routing = g_strdup_printf(
+            "/esp32/i2s%u/tx-live-routing", port);
+        g_test_add_data_func(routing, GUINT_TO_POINTER(port), tx_live_routing);
         g_test_add_data_func(rx, GUINT_TO_POINTER(port), rx_slave);
         g_test_add_data_func(txdma, GUINT_TO_POINTER(port), dma_tx);
         g_test_add_data_func(rxdma, GUINT_TO_POINTER(port), dma_rx);
@@ -985,12 +1108,23 @@ int main(int argc, char **argv)
             "/esp32/i2s%u/rx-transition-din-duplex", port);
         g_autofree char *channels = g_strdup_printf("/esp32/i2s%u/channel-selection", port);
         g_test_add_data_func(master, GUINT_TO_POINTER(port), receive_master);
+        g_autofree char *rxrouting = g_strdup_printf(
+            "/esp32/i2s%u/rx-live-routing", port);
+        g_test_add_data_func(rxrouting, GUINT_TO_POINTER(port), rx_live_routing);
         g_test_add_data_func(rxboundary, GUINT_TO_POINTER(port),
                              rx_analytic_dma_boundary);
         g_test_add_data_func(rxstatic, GUINT_TO_POINTER(port),
                              rx_static_din_duplex);
         g_test_add_data_func(rxtransition, GUINT_TO_POINTER(port),
                              rx_transition_din_duplex);
+        const char *updates[] = {"refresh", "reroute-static", "reroute-driven",
+                                 "stop"};
+        for (unsigned change = 0; change < G_N_ELEMENTS(updates); change++) {
+            g_autofree char *name = g_strdup_printf(
+                "/esp32/i2s%u/rx-slave-%s", port, updates[change]);
+            g_test_add_data_func(name, GUINT_TO_POINTER((change << 1) | port),
+                                 rx_slave_live_update);
+        }
         g_test_add_data_func(channels, GUINT_TO_POINTER(port), channel_selection);
         g_autofree char *unmodeled = g_strdup_printf("/esp32/i2s%u/unmodeled-is-unknown", port);
         g_test_add_data_func(unmodeled, GUINT_TO_POINTER(port), unsupported_mode);

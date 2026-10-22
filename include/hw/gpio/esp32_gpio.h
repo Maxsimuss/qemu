@@ -101,6 +101,7 @@ struct Esp32GpioState {
     uint64_t output_pads[ESP32_GPIO_OUTPUTS];
     uint64_t input_signals[ESP32_GPIO_PADS][ESP32_GPIO_SIGNALS / 64];
     uint64_t pending_pads;
+    uint64_t pending_analytic_pads;
     bool routes_valid;
     bool pending_all_inputs;
     bool resolving;
@@ -136,6 +137,7 @@ void esp32_gpio_set_board_pull(Esp32GpioState *s, unsigned pad, bool pull);
 Esp32PadLevel esp32_gpio_get_pad(Esp32GpioState *s, unsigned pad);
 void esp32_gpio_add_pad_listener(Esp32GpioState *s, unsigned pad, qemu_irq sink);
 void esp32_gpio_remove_pad_listener(Esp32GpioState *s, unsigned pad, qemu_irq sink);
+/* Level 0 commits elapsed samples before an edit; level 1 sees the new route. */
 void esp32_gpio_add_routing_listener(Esp32GpioState *s, qemu_irq sink);
 void esp32_gpio_remove_routing_listener(Esp32GpioState *s, qemu_irq sink);
 bool esp32_gpio_output_is_routed(Esp32GpioState *s, unsigned signal);
