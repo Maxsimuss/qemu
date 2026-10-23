@@ -15,8 +15,8 @@
  * after the address phase is the register pointer with auto-increment
  * (sequential write/read). Register 0x00 selects the page in every book;
  * register 0x7F selects the book only on page 0. On nonzero DSP pages,
- * register 0x7F is data. Sequential transfers wrap within the page;
- * multi-page wrap per I2C_PAGE_AUTO_INC is not modeled.
+ * register 0x7F is data. At the page boundary, I2C_PAGE_AUTO_INC selects
+ * either register 0x08 of the next page or register 0x00 of the same page.
  *
  * Book 0 page 0 (reset values): 0x01 RESET_CTRL (0x00) W auto-clear
  * only; 0x02 DEVICE_CTRL1 (0x00); 0x03 DEVICE_CTRL2 (0x10) DIS_DSP/MUTE/
@@ -82,6 +82,7 @@ OBJECT_DECLARE_SIMPLE_TYPE(Esp32Tas5828m, ESP32_TAS5828M)
 #define R_RESET_CTRL      0x01
 #define R_DEVICE_CTRL1    0x02
 #define R_DEVICE_CTRL2    0x03
+#define R_PAGE_AUTO_INC   0x0F
 #define R_SIG_CH_CTRL     0x28
 #define R_SAP_CTRL1       0x33
 #define R_SAP_CTRL2       0x34
@@ -159,10 +160,10 @@ struct Esp32Tas5828m {
     uint8_t ctrl[256];
     uint8_t cur_book, cur_page;
     bool clock_fault;
-    /* DSP RAM: book 0x8C pages 0x00-0x0C, book 0xAA pages 0x00-0x07,
+    /* DSP RAM: book 0x8C pages 0x00-0x0C, book 0xAA pages 0x00-0x08,
      * book 0x78 page 0x06 (level meters live here). */
     uint8_t ram8c[13][256];
-    uint8_t ramaa[8][256];
+    uint8_t ramaa[9][256];
     uint8_t ram78[256];
     char *coefficient_safety;
     uint8_t bq_write_page, bq_write_base, bq_write_start;
@@ -1009,7 +1010,7 @@ static uint8_t *dsp_ptr(Esp32Tas5828m *s, uint8_t book, uint8_t page,
     if (book == BOOK_DSP && page < 13) {
         return &s->ram8c[page][reg];
     }
-    if (book == BOOK_BQ && page < 8) {
+    if (book == BOOK_BQ && page < ARRAY_SIZE(s->ramaa)) {
         return &s->ramaa[page][reg];
     }
     if (book == BOOK_LVL && page == 0x06) {
@@ -1214,8 +1215,22 @@ static void pdn_event(void *opaque, int n, int value)
     }
 }
 
+static void advance_page(Esp32Tas5828m *s)
+{
+    if (s->pointer != 0x80) {
+        return;
+    }
+    if (s->ctrl[R_PAGE_AUTO_INC] & BIT(3)) {
+        s->pointer = 0;
+    } else {
+        s->cur_page++;
+        s->pointer = 0x08;
+    }
+}
+
 static void i2c_load(Esp32Tas5828m *s)
 {
+    advance_page(s);
     s->shift = reg_read(s, s->pointer++);
     s->bits = 0;
     s->phase = I2C_READ;
@@ -1242,6 +1257,7 @@ static void i2c_rise(Esp32Tas5828m *s)
                     s->expect_pointer = false;
                     s->first_data = true;
                 } else {
+                    advance_page(s);
                     bq_write_byte(s, s->pointer);
                     reg_write(s, s->pointer++, s->shift);
                 }

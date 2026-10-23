@@ -346,6 +346,57 @@ static void peer_repeated_start(void)
     }
 }
 
+/* IDF's ESP32 single-byte read emits READ(0), END before READ(1), END.
+ * Espressif's upstream QEMU also treats READ(0) as an empty command. */
+static void empty_read_resume(void)
+{
+    for (unsigned port = 0; port < 2; port++) {
+        Bus b = bus_fixture(port, true,
+            "-device esp32-i2c-peer,gpio=/machine/soc/gpio");
+        const uint8_t bytes[] = {0xa0, 0x20, 0xbe, 0xef};
+        for (unsigned i = 0; i < G_N_ELEMENTS(bytes); i++) {
+            reg(&b, 0x1c, bytes[i]);
+        }
+        reg(&b, 0x58, 0);
+        reg(&b, 0x5c, (1 << 11) | (1 << 8) | sizeof(bytes));
+        reg(&b, 0x60, 3 << 11);
+        reg(&b, 4, 0x33);
+        wait_complete(&b);
+
+        reg(&b, 0x24, 0x1fff);
+        reg(&b, 0x1c, 0xa0);
+        reg(&b, 0x1c, 0x20);
+        reg(&b, 0x1c, 0xa1);
+        reg(&b, 0x58, 0);
+        reg(&b, 0x5c, (1 << 11) | (1 << 8) | 2);
+        reg(&b, 0x60, 0);
+        reg(&b, 0x64, (1 << 11) | (1 << 8) | 1);
+        reg(&b, 0x68, (2 << 11) | (1 << 10));
+        reg(&b, 0x6c, 4 << 11);
+        reg(&b, 4, 0x33);
+        qtest_clock_step(b.q, 100000);
+        g_assert_true(rd(&b, 0x20) & (1 << 3));
+        g_assert_true(rd(&b, 0x68) & 0x80000000);
+        g_assert_cmpuint((rd(&b, 8) >> 8) & 63, ==, 0);
+        g_assert_true(rd(&b, 8) & (1 << 4));
+
+        reg(&b, 0x24, 0x1fff);
+        reg(&b, 0x58, (2 << 11) | (1 << 10) | 1);
+        reg(&b, 0x5c, 4 << 11);
+        reg(&b, 4, 0x33);
+        qtest_clock_step(b.q, 100000);
+        g_assert_true(rd(&b, 0x20) & (1 << 3));
+        g_assert_cmpuint((rd(&b, 8) >> 8) & 63, ==, 1);
+        g_assert_cmphex(rd(&b, 0x1c), ==, 0xbe);
+
+        reg(&b, 0x24, 0x1fff);
+        reg(&b, 0x58, 3 << 11);
+        reg(&b, 4, 0x33);
+        wait_complete(&b);
+        qtest_quit(b.q);
+    }
+}
+
 static void master_10bit_peer(void)
 {
     for (unsigned port = 0; port < 2; port++) {
@@ -840,6 +891,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/i2c/master-ack-nack", master_ack_nack);
     qtest_add_func("/esp32/i2c/stretch-timeout-arbitration", stretch_timeout_arbitration);
     qtest_add_func("/esp32/i2c/peer-repeated-start", peer_repeated_start);
+    qtest_add_func("/esp32/i2c/empty-read-resume", empty_read_resume);
     qtest_add_func("/esp32/i2c/end-resume-gate-reset", end_resume_gate_reset);
     qtest_add_func("/esp32/i2c/stored-command-reuse", stored_command_reuse);
     qtest_add_func("/esp32/i2c/fifo-overflow-interrupt-mask", fifo_overflow_and_interrupt_mask);

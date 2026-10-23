@@ -462,6 +462,46 @@ static void book_selector_page_scope(void)
     dut_end(&d);
 }
 
+static void page_auto_increment(void)
+{
+    Dut d = dut_start(NULL);
+    uint8_t bytes[20], received[20];
+
+    for (unsigned i = 0; i < sizeof(bytes); i++) {
+        bytes[i] = 0x80 + i;
+    }
+    set_book_page(d.q, 0x00, 0x00);
+    g_assert_cmphex(tas_get(d.q, 0x0f), ==, 0);
+    set_book_page(d.q, 0xaa, 0x07);
+    g_assert_true(tas_write(d.q, TAS_ADDR, 0x7c, bytes, sizeof(bytes)));
+    set_book_page(d.q, 0xaa, 0x07);
+    tas_read(d.q, 0x7c, received, sizeof(received));
+    g_assert_cmpmem(received, sizeof(received), bytes, sizeof(bytes));
+    set_book_page(d.q, 0xaa, 0x08);
+    tas_read(d.q, 0x08, received, 16);
+    g_assert_cmpmem(received, 16, bytes + 4, 16);
+
+    /* Disabled auto-increment wraps the pointer within the current page. */
+    set_book_page(d.q, 0x00, 0x00);
+    tas_set(d.q, 0x0f, 0x08);
+    set_book_page(d.q, 0xaa, 0x07);
+    const uint8_t wrap[] = {0x11, 0x22, 0x33, 0x44};
+    g_assert_true(tas_write(d.q, TAS_ADDR, 0x7e, wrap, sizeof(wrap)));
+    g_assert_cmphex(tas_get(d.q, 0x00), ==, 0x07);
+    g_assert_cmphex(tas_get(d.q, 0x01), ==, 0x44);
+    tas_read(d.q, 0x7e, received, 4);
+    const uint8_t expected[] = {0x11, 0x22, 0x07, 0x44};
+    g_assert_cmpmem(received, 4, expected, 4);
+    set_book_page(d.q, 0xaa, 0x08);
+    tas_read(d.q, 0x08, received, 16);
+    g_assert_cmpmem(received, 16, bytes + 4, 16);
+
+    set_book_page(d.q, 0x00, 0x00);
+    tas_set(d.q, 0x01, 0x01);
+    g_assert_cmphex(tas_get(d.q, 0x0f), ==, 0);
+    dut_end(&d);
+}
+
 static void reset_modes(void)
 {
     Dut d = dut_start(NULL);
@@ -778,6 +818,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/tas5828m/reset-modes", reset_modes);
     qtest_add_func("/esp32/tas5828m/book-selector-page-scope",
                    book_selector_page_scope);
+    qtest_add_func("/esp32/tas5828m/page-auto-increment", page_auto_increment);
     qtest_add_func("/esp32/tas5828m/coefficient-safety-checks",
                    coefficient_safety_checks);
     qtest_add_func("/esp32/tas5828m/no-pullups-float-low", no_pullups_float_low);

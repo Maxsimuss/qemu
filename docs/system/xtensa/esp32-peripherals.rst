@@ -72,6 +72,11 @@ than peripheral clock divisors or sample data.
 These models remain incomplete. Do not treat passing tests as certification
 of all legal firmware:
 
+* A zero-byte I2C READ completes without transferring data, matching
+  Espressif's QEMU implementation. IDF's ESP32 single-byte read path emits
+  this command followed by END, then resumes with a one-byte READ. TRM v5.8
+  specifies byte counts 1--255; the zero-byte case has not been verified on
+  silicon. Zero-byte WRITE remains unsupported.
 * Exact PDM filter arithmetic, CVSD/PLC, internal ADC/DAC, FIFO power-down
   retention, nonzero TIMING delay/double-sync fields, DMA hung/cmdFIFO/loop-test
   operation and DMA AHB/burst/arbitration timing are unimplemented or unverified.

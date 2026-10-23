@@ -393,10 +393,16 @@ static void esp32_i2c_command(Esp32I2CState *s)
     case I2C_OPCODE_WRITE:
     case I2C_OPCODE_READ:
         if (!s->remaining) {
-            /* TRM v5.8 section21.3.4 specifies byte_num=1..255. Do not
-             * turn an undocumented zero-length command into a successful
-             * one-byte transfer merely because an SDK emits it. */
-            warn_report_once("esp32-i2c: capability gap: zero-length READ/WRITE "
+            if (s->opcode == I2C_OPCODE_READ) {
+                /* Match Espressif's QEMU: an empty READ consumes no data.
+                 * IDF's ESP32 single-byte path follows it with END, then
+                 * resumes with READ(1) after servicing the interrupt. */
+                done(s);
+                s->cmd_index++;
+                esp32_i2c_command(s);
+                break;
+            }
+            warn_report_once("esp32-i2c: capability gap: zero-length WRITE "
                              "is outside the specified command range; "
                              "silicon behavior is unverified");
             qemu_log_mask(LOG_GUEST_ERROR, "esp32-i2c: zero-length command\n");
