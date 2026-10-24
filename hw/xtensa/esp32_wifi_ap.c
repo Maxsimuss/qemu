@@ -32,6 +32,7 @@
 #include "net/net.h"
 #include "net/eth.h"
 #include "qemu/timer.h"
+#include "qemu/guest-random.h"
 #include "qemu/log.h"
 #include "crypto/random.h"
 #include "hw/misc/trace.h"
@@ -43,7 +44,10 @@
 
 // 50ms between beacons
 #define BEACON_TIME 50000000
-#define INTER_FRAME_TIME 5000000
+#define PEER_MAX_TX_ATTEMPTS 7
+#define PEER_SLOT_NS 9000
+#define PEER_SIFS_NS 10000
+#define PEER_DIFS_NS 28000
 #define WPA_RETRY_INITIAL_NS 250000000
 #define WPA_RETRY_MAX_NS 4000000000ULL
 #define WPA_RETRY_LIMIT 5
@@ -65,29 +69,6 @@ static bool is_broadcast_mac(const uint8_t mac[6])
     };
 
     return !memcmp(mac, broadcast, sizeof(broadcast));
-}
-
-/* Peer-generated frames carry an FCS on the wire. The CCMP implementation
- * authenticates the MAC header and MSDU, so remove the validated FCS before
- * decrypting and retain the original FCS bytes for RX metadata. */
-static bool wlan_strip_valid_fcs(mac80211_frame *frame, uint8_t fcs[4])
-{
-    uint8_t *raw = (uint8_t *)frame;
-    uint16_t length = frame->frame_length;
-    uint32_t actual, expected;
-
-    if (length < IEEE80211_HEADER_SIZE + 4) {
-        return false;
-    }
-    actual = ldl_le_p(raw + length - 4);
-    expected = crc32(0, raw, length - 4);
-    if (actual != expected) {
-        return false;
-    }
-    memcpy(fcs, raw + length - 4, 4);
-    frame->frame_length = length - 4;
-    frame->pos = frame->frame_length - IEEE80211_HEADER_SIZE;
-    return true;
 }
 
 /* A probe request is necessarily addressed to the broadcast BSSID.  Once a
@@ -161,87 +142,115 @@ static void Esp32_WLAN_beacon_timer(void *opaque)
     timer_mod(s->beacon_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + BEACON_TIME);
 }
 
+static int64_t frame_airtime_6mbps_ns(uint32_t frame_bytes)
+{
+    enum {
+        PREAMBLE_US = 16,
+        SIGNAL_US = 4,
+        SYMBOL_US = 4,
+        BITS_PER_SYMBOL = 24,
+        SERVICE_BITS = 16,
+        TAIL_BITS = 6,
+        SIGNAL_EXTENSION_US = 6,
+    };
+    uint32_t bits = SERVICE_BITS + 8 * frame_bytes + TAIL_BITS;
+    uint32_t symbols = DIV_ROUND_UP(bits, BITS_PER_SYMBOL);
+    uint32_t duration_us = PREAMBLE_US + SIGNAL_US + SYMBOL_US * symbols +
+                           SIGNAL_EXTENSION_US;
+
+    return (int64_t)duration_us * 1000;
+}
+
+static bool peer_frame_expects_ack(const mac80211_frame *frame)
+{
+    return !(frame->receiver_address[0] & 1) &&
+        (frame->frame_control.type == IEEE80211_TYPE_MGT ||
+         frame->frame_control.type == IEEE80211_TYPE_DATA);
+}
+
+static int64_t peer_transmission_delay_ns(const Esp32WifiState *s)
+{
+    const mac80211_frame *frame = s->inject_queue;
+    int64_t airtime = frame_airtime_6mbps_ns(frame->frame_length);
+    int64_t wait = MAX(0, s->peer_tx_ready_ns -
+                         qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL));
+    uint32_t random;
+    uint32_t contention_window = (1U << MIN(4 + s->peer_tx_attempts, 10)) - 1;
+
+    if (frame->frame_control.type == IEEE80211_TYPE_CTL &&
+        frame->frame_control.sub_type == IEEE80211_TYPE_CTL_SUBTYPE_ACK) {
+        return wait + PEER_SIFS_NS + airtime;
+    }
+    qemu_guest_getrandom_nofail(&random, sizeof(random));
+    int64_t delay = PEER_DIFS_NS + (random & contention_window) * PEER_SLOT_NS;
+    return wait + delay + airtime;
+}
+
+static void mark_peer_frame_retry(mac80211_frame *frame)
+{
+    uint8_t *bytes = (uint8_t *)frame;
+    uint32_t length = frame->frame_length;
+    bool valid_fcs = false;
+
+    if (length >= IEEE80211_HEADER_SIZE + 4) {
+        uint32_t stored_fcs = ldl_le_p(bytes + length - 4);
+        uint32_t calculated_fcs = crc32(0, bytes, length - 4);
+
+        valid_fcs = stored_fcs == calculated_fcs;
+    }
+
+    bytes[1] |= BIT(3);
+    if (valid_fcs) {
+        stl_le_p(bytes + length - 4, crc32(0, bytes, length - 4));
+    }
+}
+
 static void Esp32_WLAN_inject_timer(void *opaque)
 {
-    Esp32WifiState *s = (Esp32WifiState *)opaque;
-    struct mac80211_frame *frame;
+    Esp32WifiState *s = opaque;
+    mac80211_frame *frame = s->inject_queue;
 
-    if (!esp32_wifi_mac_enabled(s)) {
+    if (!frame) {
         s->inject_timer_running = 0;
         return;
     }
 
-    frame = s->inject_queue;
-    if (frame) {
-        // remove from queue
-        s->inject_queue_size--;
-        s->inject_queue = frame->next_frame;
-        /* The virtual AP emits on-air CCMP frames using its own keys. Validate
-         * and remove the wire FCS before CCMP authenticates the frame. RX
-         * metadata includes FCS, so retain the original transmitted FCS after
-         * decrypting the security header and payload. */
-        if (frame->frame_control._flags & 0x10) {
-            uint8_t fcs[4];
+    ++s->peer_tx_attempts;
+    Esp32WifiRxResult result = esp32_wifi_receive_frame(s, frame);
+    bool expects_ack = peer_frame_expects_ack(frame);
+    bool retry = expects_ack && result != ESP32_WIFI_RX_ACKNOWLEDGED &&
+                 s->peer_tx_attempts < PEER_MAX_TX_ATTEMPTS;
 
-            trace_esp32_wifi_guest_frame(0, frame->frame_control.type,
-                                         frame->frame_control.sub_type,
-                                         s->ap_state, s->rf_channel,
-                                         frame->frame_length);
-            if (!wlan_strip_valid_fcs(frame, fcs)) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "wifi peer RX rejected invalid FCS len=%u\n",
-                              frame->frame_length);
-                g_free(frame);
-                frame = NULL;
-            } else if (!esp32_wifi_mac_ccmp(s, frame, false, 0)) {
-                qemu_log_mask(LOG_GUEST_ERROR,
-                              "wifi peer RX rejected CCMP len=%u RA=%02x:%02x:%02x:%02x:%02x:%02x TA=%02x:%02x:%02x:%02x:%02x:%02x PN=%02x:%02x:%02x:%02x:%02x:%02x keyid=%u\n",
-                              frame->frame_length,
-                              frame->receiver_address[0], frame->receiver_address[1],
-                              frame->receiver_address[2], frame->receiver_address[3],
-                              frame->receiver_address[4], frame->receiver_address[5],
-                              frame->transmitter_address[0], frame->transmitter_address[1],
-                              frame->transmitter_address[2], frame->transmitter_address[3],
-                              frame->transmitter_address[4], frame->transmitter_address[5],
-                              frame->data_and_fcs[0], frame->data_and_fcs[1],
-                              frame->data_and_fcs[4], frame->data_and_fcs[5],
-                              frame->data_and_fcs[6], frame->data_and_fcs[7],
-                              (frame->data_and_fcs[3] >> 6) & 3);
-                g_free(frame);
-                frame = NULL;
-            } else {
-                memcpy((uint8_t *)frame + frame->frame_length, fcs,
-                       sizeof(fcs));
-                frame->frame_length += sizeof(fcs);
-            }
-        } else {
-            trace_esp32_wifi_guest_frame(0, frame->frame_control.type,
-                                         frame->frame_control.sub_type,
-                                         s->ap_state, s->rf_channel,
-                                         frame->frame_length);
-        }
-        if (frame) {
-            Esp32_sendFrame(s, frame, frame->frame_length,
-                            frame->signal_strength);
-            g_free(frame);
+    s->peer_tx_ready_ns = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+    if (expects_ack) {
+        s->peer_tx_ready_ns += PEER_SIFS_NS + frame_airtime_6mbps_ns(14);
+        if (result != ESP32_WIFI_RX_ACKNOWLEDGED) {
+            s->peer_tx_ready_ns += PEER_SLOT_NS;
         }
     }
-    if (s->inject_queue_size > 0) {
-        // there are more packets... schedule
-        // the timer for sending them as well
-        timer_mod(s->inject_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + INTER_FRAME_TIME);
+
+    trace_esp32_wifi_peer_tx(s->peer_tx_attempts, frame->frame_length,
+                            frame->frame_control.type,
+                            frame->frame_control.sub_type, expects_ack,
+                            result == ESP32_WIFI_RX_RECEIVED ||
+                            result == ESP32_WIFI_RX_ACKNOWLEDGED,
+                            result == ESP32_WIFI_RX_ACKNOWLEDGED, retry);
+    if (retry) {
+        mark_peer_frame_retry(frame);
     } else {
-        // we wait until a new packet schedules
-        // us again
+        s->inject_queue = frame->next_frame;
+        --s->inject_queue_size;
+        s->peer_tx_attempts = 0;
+        g_free(frame);
+    }
+
+    if (s->inject_queue) {
+        timer_mod(s->inject_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  peer_transmission_delay_ns(s));
+    } else {
         s->inject_timer_running = 0;
     }
-
-    /* TAP disables its read handler when can_receive applies backpressure.
-     * Draining the injection queue must complete queued network packets so
-     * the backend's send-completion callback can enable that handler again.
-     */
     qemu_flush_queued_packets(qemu_get_queue(s->nic));
-
 }
 
 static void macprint(uint8_t *p, const char * name) {
@@ -296,6 +305,7 @@ static void wpa_remove_queued_key_frames(Esp32WifiState *s)
                 previous->next_frame = next;
             } else {
                 s->inject_queue = next;
+                s->peer_tx_attempts = 0;
             }
             g_free(frame);
             s->inject_queue_size--;
@@ -931,7 +941,8 @@ void Esp32_WLAN_insert_frame(Esp32WifiState *s, struct mac80211_frame *frame)
         // running currently, let's schedule
         // one run...
         s->inject_timer_running = 1;
-        timer_mod(s->inject_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + INTER_FRAME_TIME);
+        timer_mod(s->inject_timer, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+                  peer_transmission_delay_ns(s));
     }
 
 }
@@ -977,10 +988,7 @@ static ssize_t Esp32_WLAN_receive(NetClientState *ncs,
                                          s ? s->ap_state : 0,
                                          s && s->guest_dhcp_complete,
                                          ethertype, size, false);
-        // this should not happen, but in
-        // case it does, let's simply drop
-        // the packet
-        return -1;
+        return 0;
     }
 
     if (!s) {
@@ -1140,6 +1148,8 @@ void Esp32_WLAN_reset(Esp32WifiState *s)
     s->inject_sequence_number = 0;
     s->inject_queue = NULL;
     s->inject_queue_size = 0;
+    s->peer_tx_attempts = 0;
+    s->peer_tx_ready_ns = 0;
     if (s->beacon_timer && esp32_wifi_mac_enabled(s)) {
         timer_mod(s->beacon_timer,
                   qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) + 100000000);
@@ -1158,12 +1168,10 @@ void Esp32_WLAN_clock_changed(Esp32WifiState *s)
             s->inject_timer_running = 1;
             timer_mod(s->inject_timer,
                       qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
-                      INTER_FRAME_TIME);
+                      peer_transmission_delay_ns(s));
         }
     } else {
         timer_del(s->beacon_timer);
-        timer_del(s->inject_timer);
-        s->inject_timer_running = 0;
     }
 }
 
@@ -1193,6 +1201,8 @@ void Esp32_WLAN_cleanup(Esp32WifiState *s)
         g_free(frame);
     }
     s->inject_queue_size = 0;
+    s->peer_tx_attempts = 0;
+    s->peer_tx_ready_ns = 0;
     s->inject_timer_running = 0;
     s->guest_softap = false;
     s->guest_ap_associated = false;
@@ -1588,7 +1598,7 @@ void Esp32_WLAN_handle_frame(Esp32WifiState *s, struct mac80211_frame *frame)
                 /* The external AP receives the complete on-air frame from
                  * the MAC path. Validate and exclude its FCS before CCMP
                  * authenticates ciphertext; it is not CCMP input. */
-                if (!wlan_strip_valid_fcs(frame, fcs)) {
+                if (!esp32_wlan_strip_fcs(frame, fcs)) {
                     return;
                 }
                 const uint8_t *expected = esp32_wpa2_expected_data_key(

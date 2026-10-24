@@ -22,6 +22,12 @@
 
 #define ESP32_WIFI_SOFTAP_FLOWS 128
 
+typedef enum {
+    ESP32_WIFI_RX_DROPPED,
+    ESP32_WIFI_RX_RECEIVED,
+    ESP32_WIFI_RX_ACKNOWLEDGED,
+} Esp32WifiRxResult;
+
 typedef struct Esp32WifiSoftapFlow {
     uint8_t host_ip[4];
     uint16_t host_port;
@@ -173,6 +179,8 @@ typedef struct Esp32WifiState {
     int inject_queue_size;
     struct mac80211_frame *inject_queue;
     int inject_timer_running;
+    uint8_t peer_tx_attempts;
+    int64_t peer_tx_ready_ns;
     unsigned int inject_sequence_number;
     int beacon_ap;
 
@@ -232,7 +240,8 @@ uint8_t esp32_wifi_primary_channel(const Esp32WifiState *s);
 bool esp32_wifi_mac_ccmp(Esp32WifiState *s, mac80211_frame *frame,
                          bool encrypt, uint8_t interface_id);
 void Esp32_WLAN_clock_changed(Esp32WifiState *s);
-void Esp32_sendFrame(Esp32WifiState *s, struct mac80211_frame *frame,int length, int signal_strength);
+Esp32WifiRxResult esp32_wifi_receive_frame(Esp32WifiState *s,
+                                          const mac80211_frame *frame);
 
 REG32(WIFI_BSSID_ADDR_FST_0, 0x000);
 REG32(WIFI_BSSID_ADDR_SND_0, 0x004);
@@ -254,6 +263,8 @@ REG32(WIFI_MAC_FILTER_SND_1, 0x06c);
 
 REG32(WIFI_RXBUF_INIT_BITMASK, 0x80); // only set in mac_rxbuf_init
 REG32(WIFI_DMA_IN_STATUS, 0x84);
+    FIELD(WIFI_DMA_IN_STATUS, RX_DESCRIPTOR_RELOAD, 0, 1);
+    FIELD(WIFI_DMA_IN_STATUS, RX_ENABLE, 31, 1);
 REG32(WIFI_DMA_INLINK, 0x88);
 REG32(WIFI_NEXT_RX_DSCR, 0x8c);
 REG32(WIFI_LAST_RX_DSCR, 0x90);

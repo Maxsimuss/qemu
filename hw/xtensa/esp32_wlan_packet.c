@@ -38,6 +38,26 @@
 
 #define DHCP_MIN_OPTIONS_LEN 68
 
+bool esp32_wlan_strip_fcs(mac80211_frame *frame, uint8_t fcs[4])
+{
+    uint8_t *raw = (uint8_t *)frame;
+    uint32_t length = frame->frame_length;
+
+    if (length < IEEE80211_HEADER_SIZE + 4) {
+        return false;
+    }
+    uint32_t stored_fcs = ldl_le_p(raw + length - 4);
+    uint32_t calculated_fcs = crc32(0, raw, length - 4);
+
+    if (stored_fcs != calculated_fcs) {
+        return false;
+    }
+    memcpy(fcs, raw + length - 4, 4);
+    frame->frame_length = length - 4;
+    frame->pos = frame->frame_length - IEEE80211_HEADER_SIZE;
+    return true;
+}
+
 void insertCRC(mac80211_frame *frame) {
     uint32_t crc;
 

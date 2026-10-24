@@ -22,6 +22,8 @@
 /* MMIO accesses are traced by the shared peripheral trace infrastructure. */
 #include "hw/misc/esp32_reg.h"
 
+#define RX_DESCRIPTOR_EMPTY 0x3ff00000
+
 /*
  * The ESP32 TRM marks 0x3ff5c000..0x3ff5dfff reserved.  Independent reverse
  * engineering identifies 0x3ff5c000..0x3ff5cfff as Wi-Fi RX control.  The
@@ -846,17 +848,15 @@ static uint64_t esp32_wifi_read(void *opaque, hwaddr addr, unsigned int size)
             qemu_log_mask(LOG_UNIMP, "wifi WIFI_RXBUF_INIT_BITMASK read %08x\n", (uint32_t) addr);
             break;
         case A_WIFI_DMA_IN_STATUS:
-            r=0;
-            qemu_log_mask(LOG_UNIMP, "wifi A_WIFI_DMA_IN_STATUS read %08x\n", (uint32_t) addr);
             break;
         case A_WIFI_DMA_INLINK:
             qemu_log_mask(LOG_UNIMP, "wifi A_WIFI_DMA_INLINK read %08x\n", (uint32_t) addr);
             break;
         case A_WIFI_NEXT_RX_DSCR:
-            qemu_log_mask(LOG_UNIMP, "wifi A_WIFI_NEXT_RX_DSCR read %08x\n", (uint32_t) addr);
+            r = s->dma_inlink_address ? s->dma_inlink_address :
+                RX_DESCRIPTOR_EMPTY;
             break;
         case A_WIFI_LAST_RX_DSCR:
-            qemu_log_mask(LOG_UNIMP, "wifi A_WIFI_LAST_RX_DSCR read %08x\n", (uint32_t) addr);
             break;
         case A_WIFI_RX_POLICY_0:
             qemu_log_mask(LOG_UNIMP, "wifi A_WIFI_RX_POLICY_0 read %08x\n", (uint32_t) addr);
@@ -1308,7 +1308,19 @@ static void esp32_wifi_write(void *opaque, hwaddr addr, uint64_t v, unsigned int
             qemu_log_mask(LOG_UNIMP, "wifi WIFI_RXBUF_INIT_BITMASK write %08x=%08x\n", (uint32_t) addr, value);
             break;
         case A_WIFI_DMA_IN_STATUS:
-            qemu_log_mask(LOG_UNIMP, "wifi A_WIFI_DMA_IN_STATUS write %08x=%08x\n", (uint32_t) addr, value);
+            if ((value & R_WIFI_DMA_IN_STATUS_RX_DESCRIPTOR_RELOAD_MASK) &&
+                !s->dma_inlink_address) {
+                uint32_t last = s->mem[A_WIFI_LAST_RX_DSCR / 4];
+                dma_list_item descriptor;
+
+                if (esp32_wifi_dma_range_valid(last, sizeof(descriptor)) &&
+                    address_space_read(&address_space_memory, last,
+                                       MEMTXATTRS_UNSPECIFIED, &descriptor,
+                                       sizeof(descriptor)) == MEMTX_OK) {
+                    s->dma_inlink_address = ldl_le_p(&descriptor.next);
+                }
+            }
+            value &= ~R_WIFI_DMA_IN_STATUS_RX_DESCRIPTOR_RELOAD_MASK;
             break;
         case A_WIFI_DMA_INLINK:
             s->dma_inlink_address = value;
@@ -1584,8 +1596,12 @@ static const uint8_t *wifi_frame_bssid(const mac80211_frame *frame)
     return frame->address_3;
 }
 
-// frame from QEMU to ESP32
-void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int signal_strength) {
+Esp32WifiRxResult esp32_wifi_receive_frame(Esp32WifiState *s,
+                                          const mac80211_frame *wire_frame)
+{
+    mac80211_frame received_frame;
+    const mac80211_frame *frame = wire_frame;
+    uint32_t length = frame ? frame->frame_length : 0;
     uint8_t header[28 + ESP32_WIFI_MAX_FRAME_SIZE];
     size_t dma_length;
     dma_list_item item;
@@ -1593,23 +1609,23 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
     uint32_t next_descriptor;
     MemTxResult result;
 
-    if (!esp32_wifi_mac_enabled(s) || s->dma_inlink_address == 0) {
-        return;
+    if (!esp32_wifi_mac_enabled(s) || s->dma_inlink_address == 0 ||
+        !(s->mem[A_WIFI_DMA_IN_STATUS / 4] & R_WIFI_DMA_IN_STATUS_RX_ENABLE_MASK)) {
+        return ESP32_WIFI_RX_DROPPED;
     }
     if (!frame || length < 10 || length > ESP32_WIFI_MAX_FRAME_SIZE ||
-        frame->frame_length != length ||
         ((frame->frame_control.type == IEEE80211_TYPE_CTL && length < 10) ||
          (frame->frame_control.type != IEEE80211_TYPE_CTL &&
           length < IEEE80211_HEADER_SIZE))) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "wifi RX frame has invalid length %d (frame length %u)\n",
                       length, frame ? frame->frame_length : 0);
-        return;
+        return ESP32_WIFI_RX_DROPPED;
     }
     wifi_pkt_rx_ctrl_t *pkt=(wifi_pkt_rx_ctrl_t *)header;
     const uint8_t *bssid;
     *pkt=(wifi_pkt_rx_ctrl_t){
-        .rssi=signal_strength,
+        .rssi=frame->signal_strength,
         .rate=11,
         .sig_len=length,
         .sig_len_copy=length,
@@ -1643,15 +1659,17 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
     }
     //printf("...%x %x\n",header[3],frame->receiver_address[0]);
 
-    memcpy(header+28, frame, length);
-    wifi_encode_frame_header(frame, header + 28, length);
-    dma_length = 28 + length;
+    bool protected_frame = frame->frame_control._flags & 0x10;
+    if (protected_frame && length < IEEE80211_HEADER_SIZE + 8 + 8 + 4) {
+        return ESP32_WIFI_RX_DROPPED;
+    }
+    dma_length = 28 + length - (protected_frame ? 16 : 0);
     // do a DMA transfer from the hardware to esp32 memory
     if (!esp32_wifi_dma_range_valid(s->dma_inlink_address, sizeof(item))) {
         qemu_log_mask(LOG_GUEST_ERROR,
                       "wifi RX descriptor address is outside internal DRAM: %08x\n",
                       (uint32_t)s->dma_inlink_address);
-        return;
+        return ESP32_WIFI_RX_DROPPED;
     }
     result = address_space_read(&address_space_memory, s->dma_inlink_address,
                                 MEMTXATTRS_UNSPECIFIED, &item,
@@ -1660,7 +1678,7 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
         qemu_log_mask(LOG_GUEST_ERROR,
                       "wifi RX descriptor read failed at %08x\n",
                       (uint32_t)s->dma_inlink_address);
-        return;
+        return ESP32_WIFI_RX_DROPPED;
     }
     descriptor_address = s->dma_inlink_address;
     next_descriptor = ldl_le_p(&item.next);
@@ -1675,8 +1693,28 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
                       "wifi RX descriptor at %08x cannot hold frame length %zu (buffer %u, owner %u)\n",
                       (uint32_t)s->dma_inlink_address, dma_length,
                       wifi_desc_size(&item), wifi_desc_owner(&item));
-        return;
+        return ESP32_WIFI_RX_DROPPED;
     }
+    if (frame->frame_control.type != IEEE80211_TYPE_CTL) {
+        uint8_t fcs[4];
+
+        received_frame = *wire_frame;
+        if (!esp32_wlan_strip_fcs(&received_frame, fcs) ||
+            (protected_frame &&
+             !esp32_wifi_mac_ccmp(s, &received_frame, false, 0))) {
+            return ESP32_WIFI_RX_DROPPED;
+        }
+        memcpy((uint8_t *)&received_frame + received_frame.frame_length,
+               fcs, sizeof(fcs));
+        received_frame.frame_length += sizeof(fcs);
+        frame = &received_frame;
+    }
+    length = frame->frame_length;
+    pkt->sig_len = length;
+    pkt->sig_len_copy = length;
+    pkt->legacy_length = length;
+    memcpy(header + 28, frame, length);
+    wifi_encode_frame_header(frame, header + 28, length);
     result = address_space_write(&address_space_memory,
                                  ldl_le_p(&item.address),
                                  MEMTXATTRS_UNSPECIFIED, header, dma_length);
@@ -1684,7 +1722,7 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
         qemu_log_mask(LOG_GUEST_ERROR,
                       "wifi RX frame write failed at %08x length %zu\n",
                       ldl_le_p(&item.address), dma_length);
-        return;
+        return ESP32_WIFI_RX_DROPPED;
     }
     wifi_desc_set_rx_result(&item, dma_length);
     result = address_space_write(&address_space_memory,
@@ -1695,13 +1733,21 @@ void Esp32_sendFrame(Esp32WifiState *s, mac80211_frame *frame, int length, int s
         qemu_log_mask(LOG_GUEST_ERROR,
                       "wifi RX descriptor completion write failed at %08x\n",
                       (uint32_t)s->dma_inlink_address);
-        return;
+        return ESP32_WIFI_RX_DROPPED;
     }
+    s->mem[A_WIFI_LAST_RX_DSCR / 4] = descriptor_address;
     s->dma_inlink_address=next_descriptor;
     set_interrupt(s, 0x1000024);
     trace_esp32_wifi_rx_dma_complete(
         descriptor_address, next_descriptor, dma_length, 0x1000024,
         frame->frame_control.type, frame->frame_control.sub_type);
+    if ((frame->frame_control.type == IEEE80211_TYPE_MGT ||
+         frame->frame_control.type == IEEE80211_TYPE_DATA) &&
+        !(frame->receiver_address[0] & 1) &&
+        (pkt->damatch0 || pkt->damatch1)) {
+        return ESP32_WIFI_RX_ACKNOWLEDGED;
+    }
+    return ESP32_WIFI_RX_RECEIVED;
 }
 
 static const MemoryRegionOps esp32_wifi_ops = {

@@ -63,3 +63,46 @@ delays are fixed virtual-time approximations. Private register reset values
 and analog transfer functions remain unverified. See
 ``docs/devel/esp32-apll.md`` for the analog-I2C/APLL subset. Register and
 protocol tests do not establish complete PHY fidelity.
+
+Receive buffers and retransmissions
+----------------------------------
+
+``RX_CTRL`` at ``0x3ff73084`` retains reception-enable bit 31. Descriptor
+reload bit 0 self-clears. ``RX_DESCR_NEXT`` at ``0x3ff7308c`` reports
+``0x3ff00000`` when the list is exhausted; ``RX_DESCR_LAST`` at
+``0x3ff73090`` reports the last completed descriptor. Reloading an exhausted
+list fetches the link appended to that descriptor. These operations follow
+ESP-IDF 6.1's ``libpp.a(wdev.o)`` and ``libpp.a(hal_mac_rx.o)`` and the
+hardware driver in ESP32 Open MAC, commit
+``20ce43d595be914b4d3f553b28352bc07e003fa1``:
+
+https://github.com/esp32-open-mac/esp32-open-mac/blob/20ce43d595be914b4d3f553b28352bc07e003fa1/main/hardware.c
+
+That hardware reference states that automatic ACK transmission requires
+placing the frame in an RX buffer. Each arriving frame therefore attempts
+reception immediately. Disabled reception, an exhausted descriptor list,
+or a descriptor unavailable to DMA prevents delivery and acknowledgement.
+There is no receiver-side wait for the firmware to return a buffer. An
+unsuccessful attempt does not advance the descriptor list or CCMP receive
+packet number, and does not report a successful receive interrupt.
+
+The virtual peer uses seven transmission attempts for unicast management
+and data frames, the default short retry limit specified in RFC 5416,
+section 6.7. It transmits at 6 Mb/s with ERP-OFDM airtime, ACK waiting and
+DCF contention backoff. Retries keep the sequence number and encrypted
+payload, set the Retry bit, and update FCS. Multicast/broadcast frames get
+one attempt. Exhaustion drops the peer frame; TCP may subsequently
+retransmit its data. These are explicit peer-fixture settings, not inferred
+ESP32 transmitter configuration:
+
+https://datatracker.ietf.org/doc/html/rfc5416#section-6.7
+
+``esp32_wifi_peer_tx`` traces each attempt, its reception/ACK outcome, and
+whether another attempt is scheduled. Host-backend queuing occurs before
+these radio attempts and does not depend on available guest DMA buffers.
+
+Overflow-specific silicon status and interrupt bits remain unverified;
+the model does not invent them. RF interference, collisions with other
+stations, rate adaptation, and aggregated/block-ack reception are not
+covered by this peer's single-frame DCF model. A successful firmware
+workload is not evidence for those unimplemented behaviors.

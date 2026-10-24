@@ -57,5 +57,6 @@ struct mac80211_frame *Esp32_WLAN_create_dhcp_discover(
 struct mac80211_frame *Esp32_WLAN_create_dhcp_request(const dhcp_t *offer,
                                                       const uint8_t server_id[4]);
 void insertCRC(mac80211_frame *frame);
+bool esp32_wlan_strip_fcs(mac80211_frame *frame, uint8_t fcs[4]);
 
 #endif // esp32_wlan_packet_h
