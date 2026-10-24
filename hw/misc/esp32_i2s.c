@@ -1017,11 +1017,9 @@ static void tx_clock(void *opaque)
             s->rx.analytic_paired = rx_analytic_tx_slave(s);
         }
         if (c->analytic_clock && c->analytic_frame_pending) {
-            ok = tx_analytic_frame_end(s, qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL),
-                                       divider);
+            ok = tx_analytic_frame_end(s, c->deadline, divider);
         } else {
-            ok = tx_analytic_frame_start(s,
-                qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL), divider);
+            ok = tx_analytic_frame_start(s, c->deadline, divider);
         }
         if (ok) {
             timer_mod_ns(c->timer, c->deadline);
@@ -1140,7 +1138,7 @@ static void rx_clock(void *opaque)
         uint64_t half_num, half_den;
         bool first_frame = !c->analytic_clock;
         bool finishing_frame = c->analytic_frame_pending;
-        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        int64_t now = c->deadline;
         __uint128_t ws_levels = 0;
         bool level = c->clock_level;
         bool ws = c->ws_level;
@@ -1632,6 +1630,7 @@ static void i2s_update(Esp32I2SState *s)
             timer_del(c->timer);
         }
         if (tx && running && master(s, true) && was_started && c->started &&
+            (REG(s, CONF1) & BIT(8)) &&
             !c->frame_valid && c->bit == 0 && c->fifo_count &&
             !(REG(s, CONF2) & BIT(5))) {
             tx_falling(s);
@@ -1934,8 +1933,15 @@ static void i2s_write(void *opaque, hwaddr address, uint64_t value, unsigned siz
     if (!mask) {
         return;
     }
+    if (address == OUT_LINK || address == IN_LINK || address == LC_CONF) {
+        int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
+        tx_analytic_publish_until(s, now);
+        rx_analytic_until(s, now);
+        rx_analytic_slave_until(s, now, s->input_level[4]);
+    }
     if (address != 0x00 && address != 0x04 && address != 0x18 &&
-        address != 0x14) {
+        address != 0x14 && address != OUT_LINK && address != IN_LINK &&
+        address != LC_CONF) {
         int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
         if (s->tx.analytic_clock) {
             tx_analytic_to_edges(s, now);

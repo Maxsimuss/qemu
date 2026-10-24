@@ -14,6 +14,7 @@
 
 #define GPIO 0x3ff44000
 #define MUX 0x3ff49000
+#define I2S0 0x3ff4f000
 
 #define PAD_SDA 18
 #define PAD_SCL 19
@@ -620,6 +621,50 @@ static void passthrough_exact(void)
     dut_end(&d);
 }
 
+static void dma_start_keeps_clocks(void)
+{
+    Dut d = dut_start(NULL);
+    QTestState *q = d.q;
+    const uint32_t descriptor = 0x3ffb0000;
+    const uint32_t samples = 0x3ffb0100;
+    const uint32_t dma_config = (1 << 12) | (1 << 8) | (1 << 6);
+    const uint32_t offsets[] = {75, 160, 240, 8000, 15990, 20500};
+
+    tas_set(q, 0x33, 0x03);
+    tas_set(q, 0x28, 0x59);
+    qtest_writel(q, 0x3ff000c0, (1 << 4) | (1 << 21));
+    qtest_writel(q, MUX + 0x24, (2 << 12) | (1 << 9));
+    qtest_writel(q, MUX + 0x28, (2 << 12) | (1 << 9));
+    qtest_writel(q, MUX + 0x1c, (2 << 12) | (1 << 9));
+    qtest_writel(q, GPIO + 0x530 + PAD_BCLK * 4, 23);
+    qtest_writel(q, GPIO + 0x530 + PAD_WS * 4, 25);
+    qtest_writel(q, GPIO + 0x530 + PAD_DATA * 4, 163);
+    qtest_writel(q, I2S0 + 0xac, (1 << 20) | 6 | (2 << 14) | (1 << 8));
+    qtest_writel(q, I2S0 + 0xb0, 8 | (8 << 6) | (32 << 12) | (32 << 18));
+    qtest_writel(q, I2S0 + 0x20, (2 << 13) | (1 << 19) | (1 << 20) | (1 << 12));
+    qtest_writel(q, I2S0 + 0x60, dma_config);
+    qtest_writel(q, I2S0 + 0x08, (1 << 4) | (1 << 10));
+    qtest_clock_step(q, 1000000);
+    tas_set(q, 0x78, 0x80);
+    g_assert_cmphex(tas_get(q, 0x71), ==, 0);
+
+    qtest_writel(q, samples, 0x12345678);
+    qtest_writel(q, samples + 4, 0x87654321);
+    for (uint32_t i = 0; i < G_N_ELEMENTS(offsets); ++i) {
+        qtest_clock_step(q, offsets[i]);
+        qtest_writel(q, descriptor, (1u << 31) | (1u << 30) | (8 << 12) | 8);
+        qtest_writel(q, descriptor + 4, samples);
+        qtest_writel(q, descriptor + 8, 0);
+        qtest_writel(q, I2S0 + 0x60, dma_config | (1 << 1));
+        qtest_writel(q, I2S0 + 0x60, dma_config);
+        qtest_writel(q, I2S0 + 0x30, (descriptor & 0xfffff) | (1 << 29));
+        qtest_clock_step(q, 50000);
+        g_assert_cmphex(tas_get(q, 0x71), ==, 0);
+    }
+
+    dut_end(&d);
+}
+
 static void bq_gain_exact(void)
 {
     Dut d = dut_start(NULL);
@@ -824,6 +869,7 @@ int main(int argc, char **argv)
     qtest_add_func("/esp32/tas5828m/no-pullups-float-low", no_pullups_float_low);
     qtest_add_func("/esp32/tas5828m/two-instances", two_instances);
     qtest_add_func("/esp32/tas5828m/passthrough-exact", passthrough_exact);
+    qtest_add_func("/esp32/tas5828m/dma-start-keeps-clocks", dma_start_keeps_clocks);
     qtest_add_func("/esp32/tas5828m/bq-gain-exact", bq_gain_exact);
     qtest_add_func("/esp32/tas5828m/bq-first-order-terms-apply-once",
                    bq_first_order_terms_apply_once);

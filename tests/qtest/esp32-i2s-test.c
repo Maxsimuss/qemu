@@ -129,6 +129,38 @@ static void tx_live_routing(gconstpointer data)
     qtest_quit(b.q);
 }
 
+static void tx_dma_after_idle(gconstpointer data)
+{
+    const unsigned offsets[] = {7625, 15500, 15750};
+    unsigned port = GPOINTER_TO_UINT(data) & 1;
+    bool shift = GPOINTER_TO_UINT(data) & 2;
+
+    for (unsigned i = 0; i < G_N_ELEMENTS(offsets); i++) {
+        TestBus b = setup(port, true, NULL);
+        const uint32_t sample = 0xa55ac33c;
+
+        qtest_writel(b.q, DESC, (1u << 31) | (1u << 30) | (4 << 12) | 4);
+        qtest_writel(b.q, DESC + 4, DATA);
+        qtest_writel(b.q, DESC + 8, 0);
+        qtest_writel(b.q, DATA, sample);
+        write_reg(&b, 0x20, read_reg(&b, 0x20) | (1 << 12));
+        write_reg(&b, 0x08, (1 << 4) | (shift ? 1 << 10 : 0));
+        qtest_clock_step(b.q, offsets[i]);
+
+        bool clock_before = pin(&b, CLK);
+        bool ws_before = pin(&b, WS);
+        write_reg(&b, 0x60, (1 << 12) | (1 << 1));
+        write_reg(&b, 0x60, 1 << 12);
+        write_reg(&b, 0x30, (DESC & 0xfffff) | (1 << 29));
+        g_assert_cmpint(pin(&b, CLK), ==, clock_before);
+        g_assert_cmpint(pin(&b, WS), ==, ws_before);
+
+        qtest_clock_step(b.q, 16000 - offsets[i]);
+        check_frame(&b, sample, shift);
+        qtest_quit(b.q);
+    }
+}
+
 static void external(TestBus *b, unsigned pad, bool value)
 {
     qtest_set_irq_in(b->q, "/machine/soc/gpio", "pad-drive", pad, value);
@@ -1049,6 +1081,13 @@ int main(int argc, char **argv)
         g_autofree char *routing = g_strdup_printf(
             "/esp32/i2s%u/tx-live-routing", port);
         g_test_add_data_func(routing, GUINT_TO_POINTER(port), tx_live_routing);
+        g_autofree char *idle_dma = g_strdup_printf(
+            "/esp32/i2s%u/tx-dma-after-idle", port);
+        g_test_add_data_func(idle_dma, GUINT_TO_POINTER(port), tx_dma_after_idle);
+        g_autofree char *idle_dma_philips = g_strdup_printf(
+            "/esp32/i2s%u/tx-dma-after-idle-philips", port);
+        g_test_add_data_func(idle_dma_philips, GUINT_TO_POINTER(port | 2),
+                             tx_dma_after_idle);
         g_test_add_data_func(rx, GUINT_TO_POINTER(port), rx_slave);
         g_test_add_data_func(txdma, GUINT_TO_POINTER(port), dma_tx);
         g_test_add_data_func(rxdma, GUINT_TO_POINTER(port), dma_rx);
