@@ -1663,7 +1663,7 @@ Esp32WifiRxResult esp32_wifi_receive_frame(Esp32WifiState *s,
     if (protected_frame && length < IEEE80211_HEADER_SIZE + 8 + 8 + 4) {
         return ESP32_WIFI_RX_DROPPED;
     }
-    dma_length = 28 + length - (protected_frame ? 16 : 0);
+    dma_length = 28 + length;
     // do a DMA transfer from the hardware to esp32 memory
     if (!esp32_wifi_dma_range_valid(s->dma_inlink_address, sizeof(item))) {
         qemu_log_mask(LOG_GUEST_ERROR,
